@@ -76,6 +76,7 @@ class Worker(LocalOrDistributedWorkerBase):
                         "mlp_speculator",
                         "eagle",
                         "deepseek_mtp",
+                        "glm4_moe_mtp",
                          "mimo_mtp")) \
                     else {"return_hidden_states": True}
 

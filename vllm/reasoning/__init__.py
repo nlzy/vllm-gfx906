@@ -3,6 +3,7 @@
 
 from .abs_reasoning_parsers import ReasoningParser, ReasoningParserManager
 from .deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
+from .glm4_moe_reasoning_parser import Glm4MoeModelReasoningParser
 from .granite_reasoning_parser import GraniteReasoningParser
 from .qwen3_reasoning_parser import Qwen3ReasoningParser
 
@@ -12,4 +13,5 @@ __all__ = [
     "DeepSeekR1ReasoningParser",
     "GraniteReasoningParser",
     "Qwen3ReasoningParser",
+    "Glm4MoeModelReasoningParser",
 ]
