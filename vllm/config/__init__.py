@@ -3526,18 +3526,8 @@ class VllmConfig:
         # we use the default level. The default level depends on other
         # settings (see the below code).
         if self.compilation_config.level is None:
-            if envs.VLLM_USE_V1:
-                if (self.model_config is not None
-                        and not self.model_config.enforce_eager):
-                    self.compilation_config.level = CompilationLevel.PIECEWISE
-                else:
-                    self.compilation_config.level = \
-                            CompilationLevel.NO_COMPILATION
-
-            else:
-                # NB: Passing both --enforce-eager and a compilation level
-                # in V0 means the compilation level wins out.
-                self.compilation_config.level = CompilationLevel.NO_COMPILATION
+            # NOTE(gfx906): default NO_COMPILATION
+            self.compilation_config.level = CompilationLevel.NO_COMPILATION
 
         # async tp is built on top of sequence parallelism
         # and requires it to be enabled.
@@ -3555,6 +3545,10 @@ class VllmConfig:
                     == CompilationLevel.PIECEWISE:
                     self.compilation_config.cudagraph_mode = \
                         CUDAGraphMode.PIECEWISE
+                elif envs.VLLM_USE_V1:
+                    # NOTE(gfx906): default FULL_DECODE_ONLY on V1
+                    self.compilation_config.cudagraph_mode = \
+                        CUDAGraphMode.FULL_DECODE_ONLY
                 else:
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
@@ -3737,7 +3731,8 @@ class VllmConfig:
                 self.model_config is not None and \
                     not self.model_config.enforce_eager:
 
-                possible_sizes = [1, 2, 4] + [8 * i for i in range(1, 5)]
+                # NOTE(gfx906): reduce to 128
+                possible_sizes = [1, 2, 4] + [8 * i for i in range(1, 17)]
                 if self.parallel_config.tensor_parallel_size > 1 and \
                     self.compilation_config.pass_config.enable_sequence_parallelism:
                     possible_sizes = self.update_sizes_for_sequence_parallelism(

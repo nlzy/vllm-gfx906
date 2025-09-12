@@ -1710,6 +1710,54 @@ void shuffle_exllama_weight(uint32_t* q_weight, int* q_perm, int height,
   shuffle_kernel<<<gridDim, blockDim, 0, stream>>>(q_weight, height, width);
 }
 
+__global__ void shuffle_awq_qweight_kernel(uint32_t *q_weight, uint32_t *q_tmp,
+                                           int size_k, int size_n)
+{
+  int awq_k = blockIdx.x * 8; /* unpack_k */
+  int awq_stride = size_n / 8;
+  uint32_t *q_block_weight = q_weight + awq_k*awq_stride;
+  uint32_t *q_block_tmp = q_tmp + awq_k*awq_stride;
+
+  for (auto gptq_n = threadIdx.x; gptq_n < size_n; gptq_n += blockDim.x) {
+    uint32_t w = q_block_weight[gptq_n];
+    shuffle_4bit_8(&w, 0);
+    shuffle_4bit_8(&w, 0);
+    q_block_tmp[gptq_n] = w;
+  }
+
+  __syncthreads();
+
+  for (auto gptq_n = threadIdx.x; gptq_n < size_n; gptq_n += blockDim.x) {
+    uint32_t w = 0;
+    int awq_n = gptq_n / 8;
+    int awq_bf = (gptq_n % 8) * 4;
+    w |= ((q_block_tmp[0*awq_stride + awq_n] >> awq_bf) & 0xF) << 0;
+    w |= ((q_block_tmp[1*awq_stride + awq_n] >> awq_bf) & 0xF) << 4;
+    w |= ((q_block_tmp[2*awq_stride + awq_n] >> awq_bf) & 0xF) << 8;
+    w |= ((q_block_tmp[3*awq_stride + awq_n] >> awq_bf) & 0xF) << 12;
+    w |= ((q_block_tmp[4*awq_stride + awq_n] >> awq_bf) & 0xF) << 16;
+    w |= ((q_block_tmp[5*awq_stride + awq_n] >> awq_bf) & 0xF) << 20;
+    w |= ((q_block_tmp[6*awq_stride + awq_n] >> awq_bf) & 0xF) << 24;
+    w |= ((q_block_tmp[7*awq_stride + awq_n] >> awq_bf) & 0xF) << 28;
+    shuffle_4bit_8(&w, 0);
+    q_block_weight[gptq_n] = w;
+  }
+}
+
+void shuffle_awq_qweight_launch(uint32_t *q_weight, uint32_t *q_tmp,
+                                int height, int width)
+{
+  dim3 blockDim, gridDim;
+  blockDim.x = THREADS_X;
+  blockDim.y = 1;
+  gridDim.x = height / 8;
+  gridDim.y = 1;
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  shuffle_awq_qweight_kernel<<<gridDim, blockDim, 0, stream>>>(
+      q_weight, q_tmp,height, width);
+}
+
+
 }  // namespace gptq
 }  // namespace vllm
 
@@ -1755,4 +1803,20 @@ void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit) {
           ? NULL
           : (int*)q_perm.data_ptr(),
       q_weight.size(0) * 32 / bit, q_weight.size(1), bit);
+}
+
+void gptq_shuffle_awq_qweight(torch::Tensor q_weight, int64_t bit) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(q_weight));
+  TORCH_CHECK(q_weight.is_contiguous());
+  TORCH_CHECK(q_weight.size(0) % 8 == 0);
+  TORCH_CHECK(bit == 4, "Only support Int4");
+
+  auto options = torch::TensorOptions().dtype(q_weight.dtype())
+                                       .device(q_weight.device());
+  at::Tensor q_tmp = torch::empty(q_weight.sizes(), options);
+
+  vllm::gptq::shuffle_awq_qweight_launch((uint32_t*)q_weight.data_ptr(),
+                                         (uint32_t*)q_tmp.data_ptr(),
+                                         q_weight.size(0),
+                                         q_weight.size(1) * 8);
 }

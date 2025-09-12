@@ -540,6 +540,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
   ops.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
 
+  ops.def("gptq_shuffle_awq_qweight(Tensor! q_weight, int bit) -> ()");
+  ops.impl("gptq_shuffle_awq_qweight", torch::kCUDA, &gptq_shuffle_awq_qweight);
+
   // Compute FP8 quantized tensor for given scaling factor.
   ops.def(
       "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale) -> "

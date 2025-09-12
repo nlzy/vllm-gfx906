@@ -4,10 +4,9 @@ vLLM for gfx906
 This is a modified version of vLLM, works with (and only works with) AMD gfx906
 GPUs such as Radeon VII / Radeon Pro VII / Instinct MI50 / Instinct MI60.
 
-This modified version of vLLM does two things:
-
-1. Makes vLLM could run on gfx906 GPUs.
-2. Optimizes quantization GEMV kernels for gfx906 GPUs.
+This fork was (and still is) just a passion project shared for fun. I won't be
+putting much effort into it. Use it at your own risk, especially please don't
+use it as a reference for your GPU purchasing decisions.
 
 
 RUN WITH DOCKER
@@ -27,23 +26,37 @@ docker run -it --rm --shm-size=2g --device=/dev/kfd --device=/dev/dri \
 SUPPORT QUANTIZATIONS
 -------------------
 
+See https://github.com/nlzy/vllm-gfx906/issues/29
+
 GPTQ and AWQ are the first recommended quantization formats.
 
 vLLM's llm-compressor with W4A16 INT format is also recommended. Other formats
 in llm-compressor are not support.
 
-GGUF is functional and should work. I recommend using q4_1 or q8_0 quants.
-K-quants (e.g. q4_K / q6_K) should work. I-quants (e.g. IQ4 / IQ3) have not
-tested yet.
-
-MoE quantization models only work with llm-compressor W4A16 INT format. And
-such models are a bit slow, still need more optimization.
-
-Any non-quantized models are not optimized at all and expected be very slow.
+All MoE quantization models are significantly slow, and all unquantized models
+are slightly slow. Not recommended to use.
 
 
 NEWS
 -------------------
+
+2025-09-12:
+
+Minor optimize in triton_unified_attention, reduce VRAM usage of AWQ
+
+
+2025-09-10:
+
+Update vLLM to v0.10.1
+
+Re-enable V1 and Automatic Prefix Caching by default. Adjusted some default
+parameters of V1 engine to better suit gfx906.
+
+Optimized unquantized FP16 GEMM / GEMV, by enable skinny unquantized GEMV
+kernel, a triton unquantized GEMM implementation is also added. TG speed is
+~90% faster on unquantized models and ~10% faster on GPTQ / AWQ models at low
+batch sizes.
+
 
 2025-08-24:
 

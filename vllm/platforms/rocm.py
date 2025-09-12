@@ -404,11 +404,6 @@ class RocmPlatform(Platform):
         # V1 support on AMD gpus is experimental
         return True
 
-    # gfx906: some user reported V1 is much slower than V0, disable it
-    @classmethod
-    def default_v1(cls, model_config) -> bool:
-        return False
-
     @classmethod
     def use_custom_allreduce(cls) -> bool:
         # We only enable custom allreduce for MI300 series

@@ -387,6 +387,8 @@ def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor,
                  bit: int) -> None:
     torch.ops._C.gptq_shuffle(q_weight, q_perm, bit)
 
+def gptq_shuffle_awq_qweight(q_weight: torch.Tensor, bit: int) -> None:
+    torch.ops._C.gptq_shuffle_awq_qweight(q_weight, bit)
 
 # marlin
 def marlin_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,

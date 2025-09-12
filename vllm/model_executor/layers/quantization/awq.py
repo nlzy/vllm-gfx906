@@ -14,90 +14,10 @@ from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
+from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            PackedvLLMParameter)
 from vllm.logger import init_logger
-
-
-logger = init_logger(__name__)
-
-AWQ_ORDER = [0, 2, 4, 6, 1, 3, 5, 7]
-AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
-
-def unpack_awq(qweight: torch.Tensor, qzeros: torch.Tensor, bits: int):
-    shifts = torch.arange(0, 32, bits, device=qzeros.device)
-
-    # unpacking columnwise
-    iweights = torch.bitwise_right_shift(qweight[:, :, None], shifts[None, None, :]).to(
-        torch.int8  # smallest dtype available
-    )
-    iweights = iweights.view(iweights.shape[0], -1)
-
-    # unpacking columnwise
-    if qzeros is not None:
-        izeros = torch.bitwise_right_shift(qzeros[:, :, None], shifts[None, None, :]).to(
-            torch.int8  # smallest dtype available
-        )
-        izeros = izeros.view(izeros.shape[0], -1)
-    else:
-        izeros = qzeros
-
-    return iweights, izeros
-
-
-def reverse_awq_order(iweights: torch.Tensor, izeros: torch.Tensor, bits: int):
-    reverse_order_tensor = torch.arange(
-        iweights.shape[-1],
-        dtype=torch.int32,
-        device=izeros.device,
-    )
-    reverse_order_tensor = reverse_order_tensor.view(-1, 32 // bits)
-    reverse_order_tensor = reverse_order_tensor[:, AWQ_REVERSE_ORDER]
-    reverse_order_tensor = reverse_order_tensor.view(-1)
-
-    if izeros is not None:
-        izeros = izeros[:, reverse_order_tensor]
-    iweights = iweights[:, reverse_order_tensor]
-
-    return iweights, izeros
-
-
-def pack_exllama(iweights: torch.Tensor, izeros: torch.Tensor, bits: int):
-    shifts = torch.arange(0, 32, bits, device=iweights.device)
-
-    # packing rowwise
-    iweights = iweights.view(iweights.shape[0] // (32 // bits), 32 // bits, -1)
-    qweight = (
-        torch.bitwise_left_shift(iweights, shifts[None, :, None])
-        .sum(dim=1)
-        .to(torch.int32)
-    )
-
-    # packing columnwise
-    izeros = izeros.view(-1, izeros.shape[1] // (32 // bits), 32 // bits)
-    qzeros = (
-        torch.bitwise_left_shift(izeros, shifts[None, None, :])
-        .sum(dim=-1)
-        .to(torch.int32)
-    )
-
-    return qweight, qzeros
-
-
-def unpack_reorder_pack(qweight, qzeros, bits):
-    # Unpack the qweight and qzeros tensors
-    iweight, izeros = unpack_awq(qweight, qzeros, bits)
-    # Reverse the order of the iweight and izeros tensors
-    iweight, izeros = reverse_awq_order(iweight, izeros, bits)
-
-    # overflow checks
-    iweight = torch.bitwise_and(iweight, (2**bits) - 1)
-    izeros = torch.bitwise_and(izeros, (2**bits) - 1)
-
-    # Pack the qweight and qzeros tensors
-    qweight, qzeros = pack_exllama(iweight, izeros, bits)
-
-    return qweight, qzeros
 
 logger = init_logger(__name__)
 
@@ -268,19 +188,25 @@ class AWQLinearMethod(LinearMethodBase):
         layer.register_parameter("scales", scales)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        qweight, qzeros = unpack_reorder_pack(
-            layer.qweight.data, layer.qzeros.data,
-            self.quant_config.weight_bits
-        )
-        scales = layer.scales.data
+        layer.qweight = torch.nn.Parameter(layer.qweight.data,
+                                           requires_grad=False)
+        layer.qzeros = torch.nn.Parameter(layer.qzeros.data,
+                                          requires_grad=False)
+        layer.scales = torch.nn.Parameter(layer.scales.data,
+                                          requires_grad=False)
 
-        layer.qweight = Parameter(qweight, requires_grad=False)
-        layer.qzeros = Parameter(qzeros, requires_grad=False)
-        layer.scales = Parameter(scales, requires_grad=False)
+        bits = self.quant_config.weight_bits
+        empty = torch.empty(0, device=layer.qzeros.device)
 
-        ops.gptq_shuffle(layer.qweight,
-                         torch.empty(0, device=layer.qweight.device),
-                         self.quant_config.weight_bits)
+        # hints: shuffle twice is equal to unshuffle once
+        ops.gptq_shuffle(layer.qzeros, empty, bits)
+        ops.gptq_shuffle(layer.qzeros, empty, bits)
+
+        ops.gptq_shuffle_awq_qweight(layer.qweight, bits)
+        layer.qweight.data = layer.qweight.reshape((layer.qweight.shape[0] // 8,
+                                                    layer.qweight.shape[1] * 8))
+        replace_parameter(layer, "qweight", layer.qweight.data)
+
 
     def apply(self,
               layer: torch.nn.Module,

@@ -291,6 +291,8 @@ torch::Tensor gptq_gemm(torch::Tensor a, torch::Tensor b_q_weight,
 
 void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 
+void gptq_shuffle_awq_qweight(torch::Tensor q_weight, int64_t bit);
+
 void static_scaled_fp8_quant(torch::Tensor& out, torch::Tensor const& input,
                              torch::Tensor const& scale);
 

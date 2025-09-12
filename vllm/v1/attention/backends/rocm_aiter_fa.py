@@ -18,8 +18,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 _PARTITION_SIZE_ROCM = 256
 
 if current_platform.is_rocm():
-    import aiter
-
     from vllm.triton_utils import tl, triton
     from vllm.utils import direct_register_custom_op
 
@@ -149,6 +147,8 @@ if current_platform.is_rocm():
         v_scale: torch.Tensor,
         total_tokens: int = 0,
     ) -> torch.Tensor:
+        import aiter
+
         if total_tokens == 0:
             total_tokens = int(cu_seqlens_k[-1].item())
         k, v = vllm_layout_trans(cu_seqlens_q, cu_seqlens_k, block_table,

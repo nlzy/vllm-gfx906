@@ -240,8 +240,9 @@ class SchedulerConfig:
         # This avoids OOM in tight memory scenarios with small max_num_seqs,
         # and prevents capture of many large graphs (>512) that would greatly
         # increase startup time with limited performance benefit.
+        # NOTE(gfx906): reduce to 128
         if not self.cuda_graph_sizes:
-            self.cuda_graph_sizes = [min(self.max_num_seqs * 2, 512)]
+            self.cuda_graph_sizes = [min(self.max_num_seqs * 2, 128)]
 
         if self.async_scheduling:
             self.scheduler_cls = (
