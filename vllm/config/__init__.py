@@ -2675,17 +2675,17 @@ _FLOAT16_NOT_SUPPORTED_MODELS = {
 
 
 def _is_valid_dtype(model_type: str, dtype: torch.dtype):
-    if model_type in _FLOAT16_NOT_SUPPORTED_MODELS and dtype == torch.float16:  # noqa: E501, SIM103
-        return False
-
+    # NOTE(gfx906): ignore numerical instability
     return True
 
 
 def _check_valid_dtype(model_type: str, dtype: torch.dtype):
+    # NOTE(gfx906): ignore numerical instability
     if model_type in _FLOAT16_NOT_SUPPORTED_MODELS and dtype == torch.float16:
         reason = _FLOAT16_NOT_SUPPORTED_MODELS[model_type]
-        raise ValueError(f"The model type {model_type!r} "
-                         f"does not support float16. Reason: {reason}")
+        logger.warning(f"Although using float16 in model type {model_type!r} "
+                       f"may introduce potential numerical instability issues."
+                       " gfx906 only supports float16, so we continue to use.")
 
     return True
 
@@ -2805,8 +2805,9 @@ def _get_and_verify_dtype(
     else:
         raise ValueError(f"Unknown dtype: {dtype}")
 
+    _check_valid_dtype(model_type, torch_dtype)
+
     if torch_dtype != config_dtype:
-        _check_valid_dtype(model_type, torch_dtype)
         if torch_dtype == torch.float32:
             # Upcasting to float32 is allowed.
             logger.info("Upcasting %s to %s.", config_dtype, torch_dtype)
