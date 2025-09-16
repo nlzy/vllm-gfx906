@@ -699,7 +699,9 @@ def get_moe_configs(
     # First look up if an optimized configuration is available in the configs
     # directory
     block_shape = [block_n, block_k] if block_n and block_k else None
-    json_file_name = get_config_file_name(E, N, dtype, block_shape)
+    json_file_name = get_config_file_name(E, N, dtype, block_shape).replace("/","_") # We replace / so that AMD MI50/MI60 -> AMD MI50_MI60, does not need subdir
+
+    
 
     config_file_paths = []
 
