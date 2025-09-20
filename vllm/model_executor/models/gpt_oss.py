@@ -26,6 +26,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from vllm.utils import cdiv
+from vllm.platforms import current_platform
 
 from .utils import extract_layer_index, maybe_prefix
 
@@ -145,9 +146,12 @@ class MLPBlock(torch.nn.Module):
         self.experts_per_token = config.num_experts_per_tok
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.norm = RMSNorm(config.hidden_size, eps=1e-5)
+        router_dtype = torch.bfloat16
+        if router_dtype not in current_platform.supported_dtypes:
+            router_dtype = torch.float16
         self.router = torch.nn.Linear(config.hidden_size,
                                       config.num_local_experts,
-                                      dtype=torch.bfloat16)
+                                      dtype=router_dtype)
         assert config.intermediate_size % self.world_size == 0
         self.experts = FusedMoE(num_experts=config.num_local_experts,
                                 top_k=config.num_experts_per_tok,
@@ -163,7 +167,12 @@ class MLPBlock(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = self.norm(x)
-        g = self.router(t)
+        router_input = t
+        if router_input.dtype != self.router.weight.dtype:
+            router_input = router_input.to(self.router.weight.dtype)
+        g = self.router(router_input)
+        if g.dtype != t.dtype:
+            g = g.to(t.dtype)
         t = self.experts(hidden_states=t, router_logits=g)
         return x + t
 

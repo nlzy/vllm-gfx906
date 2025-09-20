@@ -8,7 +8,8 @@ from torch.nn.parameter import Parameter
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEConfig,
-                                                  FusedMoEMethodBase)
+                                                  FusedMoEMethodBase,
+                                                  fused_experts)
 from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
     triton_kernel_moe_forward)
 from vllm.model_executor.layers.linear import (LinearBase,
@@ -19,7 +20,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     prepare_moe_fp4_layer_for_marlin)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-    _can_support_mxfp4, _swizzle_mxfp4)
+    _can_support_mxfp4, _swizzle_mxfp4, dequant_mxfp4)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped)
 from vllm.model_executor.utils import set_weight_attrs
@@ -81,7 +82,10 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16]
+        dtypes = [torch.bfloat16]
+        if torch.float16 in current_platform.supported_dtypes:
+            dtypes.append(torch.float16)
+        return dtypes
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -113,6 +117,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.topk_indices_dtype = None
         self.moe = moe
         self.use_marlin = self._should_use_marlin()
+        self.use_emulated_mxfp4 = False
+        self.w13_precision_config = None
+        self.w2_precision_config = None
+        self.w13_weight_triton_tensor = None
+        self.w2_weight_triton_tensor = None
 
         if current_platform.is_device_capability(100) and not has_flashinfer():
             logger.warning_once(
@@ -384,7 +393,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_bias = Parameter(torch.stack(gemm2_bias_shuffled).reshape(
                 self.num_experts, -1),
                                       requires_grad=False)
-        else:
+        elif current_platform.supports_mx() and has_triton_kernels():
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             w13_bias = layer.w13_bias.to(torch.float32)
@@ -419,6 +428,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight = None
             layer.w2_weight = None
             torch.cuda.empty_cache()
+        else:
+            # Fall back to emulation when MX kernels are unavailable.
+            self.use_emulated_mxfp4 = True
+            layer.w13_bias = Parameter(layer.w13_bias.to(torch.float16),
+                                       requires_grad=False)
+            layer.w2_bias = Parameter(layer.w2_bias.to(torch.float16),
+                                      requires_grad=False)
+            w_device = layer.w13_weight.device
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.to(device=w_device, dtype=torch.uint8),
+                requires_grad=False)
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.to(device=w_device, dtype=torch.uint8),
+                requires_grad=False)
+            logger.warning_once(
+                "MXFP4 kernels are unavailable on this platform. Falling back"
+                " to simulated MXFP4 execution using float16 activations.")
 
     def _get_tile_tokens_dim(self, x: torch.Tensor, top_k: int):
         # Number of tokens in the input tensor.
@@ -501,6 +527,48 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 global_num_experts=global_num_experts,
                 activation=activation,
                 expert_map=expert_map)
+
+        if self.use_emulated_mxfp4:
+            x = x.to(torch.float16)
+            if router_logits.dtype != x.dtype:
+                router_logits = router_logits.to(x.dtype)
+            topk_weights, topk_ids = FusedMoE.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                indices_type=self.topk_indices_dtype,
+                enable_eplb=enable_eplb,
+                expert_map=expert_map,
+                expert_load_view=expert_load_view,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count)
+
+            w1 = dequant_mxfp4(layer.w13_weight, layer.w13_weight_scale,
+                                x.dtype)
+            w2 = dequant_mxfp4(layer.w2_weight, layer.w2_weight_scale,
+                                x.dtype)
+
+            return fused_experts(
+                hidden_states=x,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                w1_scale=None,
+                w2_scale=None,
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias)
 
         assert _can_support_mxfp4(
             use_grouped_topk, topk_group, num_expert_group, expert_map,

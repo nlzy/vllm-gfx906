@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import AsyncExitStack
@@ -132,7 +133,10 @@ class OpenAIServingResponses(OpenAIServing):
                 "cause a memory leak since we never remove responses from "
                 "the store.")
 
-        self.use_harmony = model_config.hf_config.model_type == "gpt_oss"
+        disable_harmony = os.getenv("VLLM_DISABLE_GPTOSS_HARMONY", "0") == "1"
+        self.use_harmony = (
+            model_config.hf_config.model_type == "gpt_oss"
+            and not disable_harmony)
         if self.use_harmony:
             logger.warning("For gpt-oss, we ignore --enable-auto-tool-choice "
                            "and always enable tool use.")
