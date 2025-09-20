@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -134,7 +135,10 @@ class OpenAIServingChat(OpenAIServing):
             logger.info("Using default chat sampling params from %s: %s",
                         source, self.default_sampling_params)
 
-        self.use_harmony = model_config.hf_config.model_type == "gpt_oss"
+        disable_harmony = os.getenv("VLLM_DISABLE_GPTOSS_HARMONY", "0") == "1"
+        self.use_harmony = (
+            model_config.hf_config.model_type == "gpt_oss"
+            and not disable_harmony)
         if self.use_harmony:
             if "stop_token_ids" not in self.default_sampling_params:
                 self.default_sampling_params["stop_token_ids"] = []

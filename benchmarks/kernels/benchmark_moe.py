@@ -392,13 +392,24 @@ def merge_unique_dicts(list1, list2):
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
     def __init__(self, seed: int) -> None:
-        torch.set_default_device("cuda")
         current_platform.seed_everything(seed)
         self.seed = seed
-        # Get the device ID to allocate tensors and kernels
-        # on the respective GPU. This is required for Ray to work
-        # correctly with multi-GPU tuning on the ROCm platform.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        # Ray returns the physical GPU ordinal. When ROCR_VISIBLE_DEVICES is
+        # set, each worker only exposes a single logical GPU (cuda:0).
+        if current_platform.is_rocm():
+            rocr_visible = os.environ.get("ROCR_VISIBLE_DEVICES")
+            if rocr_visible:
+                os.environ.setdefault("HIP_VISIBLE_DEVICES", rocr_visible)
+                os.environ.setdefault("CUDA_VISIBLE_DEVICES", rocr_visible)
+        else:
+            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if cuda_visible:
+                os.environ.setdefault("HIP_VISIBLE_DEVICES", cuda_visible)
+        # Ray assigns one GPU per worker, which is exposed as cuda:0 inside the
+        # worker process once the visible devices are set.
+        self.device_id = 0
+        torch.cuda.set_device(self.device_id)
+        torch.set_default_device("cuda:0")
 
     def benchmark(
         self,
@@ -477,13 +488,14 @@ class BenchmarkWorker:
                 topk,
             )
 
-        need_device_guard = False
         if current_platform.is_rocm():
-            visible_device = os.environ.get("ROCR_VISIBLE_DEVICES", None)
-            if visible_device != f"{self.device_id}":
-                need_device_guard = True
-
-        with torch.cuda.device(self.device_id) if need_device_guard else nullcontext():
+            context = torch.cuda.device(self.device_id)
+        else:
+            visible_device = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+            need_device_guard = (visible_device is not None and
+                                 visible_device != f"{self.device_id}")
+            context = torch.cuda.device(self.device_id) if need_device_guard else nullcontext()
+        with context:
             for config in tqdm(search_space):
                 try:
                     kernel_time = benchmark_config(

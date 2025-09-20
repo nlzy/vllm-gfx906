@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from copy import deepcopy
+import os
 from typing import TYPE_CHECKING
 
 import vllm.envs as envs
@@ -252,8 +253,12 @@ class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         decoding_config = vllm_config.decoding_config
+        disable_harmony = os.getenv("VLLM_DISABLE_GPTOSS_HARMONY", "0") == "1"
         if decoding_config.reasoning_backend == "":
-            decoding_config.reasoning_backend = "GptOss"
+            if not disable_harmony:
+                decoding_config.reasoning_backend = "GptOss"
+        elif disable_harmony and decoding_config.reasoning_backend == "GptOss":
+            decoding_config.reasoning_backend = ""
 
         # Increase the max capture size from 512 to 1024 for performance.
         # NOTE(woosuk): This will increase the number of CUDA graphs
