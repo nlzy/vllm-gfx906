@@ -429,19 +429,78 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = None
             torch.cuda.empty_cache()
         else:
-            # Fall back to emulation when MX kernels are unavailable.
+            # Fall back to emulation when MX kernels are unavailable. We
+            # pre-dequantize the weights once during loading and reuse the
+            # dense tensors for inference to align behaviour with the upstream
+            # float16 path and avoid doing heavy dequantization every forward.
             self.use_emulated_mxfp4 = True
-            layer.w13_bias = Parameter(layer.w13_bias.to(torch.float16),
-                                       requires_grad=False)
-            layer.w2_bias = Parameter(layer.w2_bias.to(torch.float16),
-                                      requires_grad=False)
             w_device = layer.w13_weight.device
-            layer.w13_weight_scale = Parameter(
-                layer.w13_weight_scale.to(device=w_device, dtype=torch.uint8),
-                requires_grad=False)
-            layer.w2_weight_scale = Parameter(
-                layer.w2_weight_scale.to(device=w_device, dtype=torch.uint8),
-                requires_grad=False)
+
+            # Ensure the quantized tensors and scales are on device before
+            # invoking the quark dequantization kernels.
+            q_w13 = layer.w13_weight.to(device=w_device)
+            q_w13_scale = layer.w13_weight_scale.to(device=w_device,
+                                                    dtype=torch.uint8)
+            q_w2 = layer.w2_weight.to(device=w_device)
+            q_w2_scale = layer.w2_weight_scale.to(device=w_device,
+                                                  dtype=torch.uint8)
+
+            deq_dtype = torch.float16
+            w13_deq = dequant_mxfp4(q_w13, q_w13_scale,
+                                     deq_dtype).contiguous()
+            w2_deq = dequant_mxfp4(q_w2, q_w2_scale,
+                                   deq_dtype).contiguous()
+
+            layer.w13_weight = Parameter(w13_deq, requires_grad=False)
+            layer.w2_weight = Parameter(w2_deq, requires_grad=False)
+
+            # Biases stay in float32 for numerical stability, but we cache
+            # float16 copies for the emulated matmul to avoid casting every
+            # forward.
+            w13_bias_fp32 = layer.w13_bias.to(torch.float32)
+            w2_bias_fp32 = layer.w2_bias.to(torch.float32)
+            layer.w13_bias = Parameter(w13_bias_fp32, requires_grad=False)
+            layer.w2_bias = Parameter(w2_bias_fp32, requires_grad=False)
+            if "w13_bias_emulated" in layer._buffers:
+                layer._buffers["w13_bias_emulated"] = w13_bias_fp32.to(
+                    deq_dtype)
+            else:
+                layer.register_buffer("w13_bias_emulated",
+                                      w13_bias_fp32.to(deq_dtype),
+                                      persistent=False)
+            if "w2_bias_emulated" in layer._buffers:
+                layer._buffers["w2_bias_emulated"] = w2_bias_fp32.to(
+                    deq_dtype)
+            else:
+                layer.register_buffer("w2_bias_emulated",
+                                      w2_bias_fp32.to(deq_dtype),
+                                      persistent=False)
+
+            # Retain the original quantized tensors as buffers so that the
+            # checkpoint can still be saved without losing MXFP4 metadata.
+            if "w13_weight_quantized" in layer._buffers:
+                layer._buffers["w13_weight_quantized"] = q_w13
+            else:
+                layer.register_buffer("w13_weight_quantized", q_w13,
+                                      persistent=False)
+            if "w13_weight_scale_quantized" in layer._buffers:
+                layer._buffers["w13_weight_scale_quantized"] = q_w13_scale
+            else:
+                layer.register_buffer("w13_weight_scale_quantized",
+                                      q_w13_scale,
+                                      persistent=False)
+            if "w2_weight_quantized" in layer._buffers:
+                layer._buffers["w2_weight_quantized"] = q_w2
+            else:
+                layer.register_buffer("w2_weight_quantized", q_w2,
+                                      persistent=False)
+            if "w2_weight_scale_quantized" in layer._buffers:
+                layer._buffers["w2_weight_scale_quantized"] = q_w2_scale
+            else:
+                layer.register_buffer("w2_weight_scale_quantized",
+                                      q_w2_scale,
+                                      persistent=False)
+
             logger.warning_once(
                 "MXFP4 kernels are unavailable on this platform. Falling back"
                 " to simulated MXFP4 execution using float16 activations.")
@@ -484,6 +543,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -507,6 +567,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_expert_group=num_expert_group,
                 custom_routing_function=custom_routing_function,
                 scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
                 e_score_correction_bias=e_score_correction_bias)
 
             return torch.ops.vllm.fused_marlin_moe(
@@ -529,9 +590,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 expert_map=expert_map)
 
         if self.use_emulated_mxfp4:
-            x = x.to(torch.float16)
-            if router_logits.dtype != x.dtype:
-                router_logits = router_logits.to(x.dtype)
+            x = x.to(layer.w13_weight.dtype)
             topk_weights, topk_ids = FusedMoE.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
@@ -542,6 +601,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_expert_group=num_expert_group,
                 custom_routing_function=custom_routing_function,
                 scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
                 e_score_correction_bias=e_score_correction_bias,
                 indices_type=self.topk_indices_dtype,
                 enable_eplb=enable_eplb,
@@ -550,15 +610,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count)
 
-            w1 = dequant_mxfp4(layer.w13_weight, layer.w13_weight_scale,
-                                x.dtype)
-            w2 = dequant_mxfp4(layer.w2_weight, layer.w2_weight_scale,
-                                x.dtype)
-
             return fused_experts(
                 hidden_states=x,
-                w1=w1,
-                w2=w2,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 activation=activation,
@@ -567,8 +622,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 expert_map=expert_map,
                 w1_scale=None,
                 w2_scale=None,
-                w1_bias=layer.w13_bias,
-                w2_bias=layer.w2_bias)
+                w1_bias=layer.w13_bias_emulated,
+                w2_bias=layer.w2_bias_emulated)
 
         assert _can_support_mxfp4(
             use_grouped_topk, topk_group, num_expert_group, expert_map,

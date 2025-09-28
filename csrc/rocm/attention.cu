@@ -24,6 +24,7 @@
 #include <algorithm>
 #include "../attention/dtype_fp8.cuh"
 #include "../quantization/fp8/amd/quant_utils.cuh"
+#include "gfx906_utils.h"
 
 #if defined(__HIPCC__) && \
     (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
@@ -574,8 +575,12 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
     }
   }
 
-  for (int mask = WARP_SIZE / 2; mask >= 16; mask /= 2) {
-    qk_max = fmaxf(qk_max, __shfl_xor(qk_max, mask));
+  if constexpr (Utils::get_warp_size() == 64) {
+    qk_max = vllm::rocm::gfx906_wave_reduce_max<64>(qk_max);
+  } else {
+    for (int mask = WARP_SIZE / 2; mask >= 16; mask /= 2) {
+      qk_max = fmaxf(qk_max, __shfl_xor(qk_max, mask));
+    }
   }
 
   for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
@@ -589,8 +594,12 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
     }
   }
 
-  for (int mask = WARP_SIZE / 2; mask >= 16; mask /= 2) {
-    exp_sum += __shfl_xor(exp_sum, mask);
+  if constexpr (Utils::get_warp_size() == 64) {
+    exp_sum = vllm::rocm::gfx906_wave_reduce_sum<64>(exp_sum);
+  } else {
+    for (int mask = WARP_SIZE / 2; mask >= 16; mask /= 2) {
+      exp_sum += __shfl_xor(exp_sum, mask);
+    }
   }
 
   __syncthreads();  // sync before writing to shared mem
@@ -1328,8 +1337,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     }
 
   #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-      max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
+    if constexpr (Utils::get_warp_size() == 64) {
+      max_logit = vllm::rocm::gfx906_wave_reduce_max<64>(max_logit);
+    } else {
+      for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+        max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
+      }
     }
 
     const float* exp_sums_ptr = exp_sums +
@@ -1360,8 +1373,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     }
 
   #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-      global_exp_sum += __shfl_xor(global_exp_sum, mask);
+    if constexpr (Utils::get_warp_size() == 64) {
+      global_exp_sum = vllm::rocm::gfx906_wave_reduce_sum<64>(global_exp_sum);
+    } else {
+      for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+        global_exp_sum += __shfl_xor(global_exp_sum, mask);
+      }
     }
     if (threadIdx.x == 0) {
       shared_global_exp_sum = global_exp_sum;
@@ -1841,7 +1858,7 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
     }
   }
 
-  qk_max = fmaxf(qk_max, __shfl_xor(qk_max, 16));
+  qk_max = vllm::rocm::gfx906_wave_reduce_max<64>(qk_max);
 
   for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
     const int local_token_idx = qkout_token_idx + token_depth * 16;
@@ -1854,7 +1871,7 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
     }
   }
 
-  exp_sum += __shfl_xor(exp_sum, 16);
+  exp_sum = vllm::rocm::gfx906_wave_reduce_sum<64>(exp_sum);
 
   __syncthreads();
 
@@ -2094,8 +2111,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     }
 
   #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-      max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
+    if constexpr (Utils::get_warp_size() == 64) {
+      max_logit = vllm::rocm::gfx906_wave_reduce_max<64>(max_logit);
+    } else {
+      for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+        max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
+      }
     }
 
     const float* exp_sums_ptr = exp_sums +
@@ -2126,8 +2147,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     }
 
   #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-      global_exp_sum += __shfl_xor(global_exp_sum, mask);
+    if constexpr (Utils::get_warp_size() == 64) {
+      global_exp_sum = vllm::rocm::gfx906_wave_reduce_sum<64>(global_exp_sum);
+    } else {
+      for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+        global_exp_sum += __shfl_xor(global_exp_sum, mask);
+      }
     }
     if (threadIdx.x == 0) {
       shared_global_exp_sum = global_exp_sum;
@@ -2607,7 +2632,7 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
     }
   }
 
-  qk_max = fmaxf(qk_max, __shfl_xor(qk_max, 16));
+  qk_max = vllm::rocm::gfx906_wave_reduce_max<64>(qk_max);
 
   for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
     const int local_token_idx = qkout_token_idx + token_depth * 16;
@@ -2620,7 +2645,7 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
     }
   }
 
-  exp_sum += __shfl_xor(exp_sum, 16);
+  exp_sum = vllm::rocm::gfx906_wave_reduce_sum<64>(exp_sum);
 
   __syncthreads();
 
@@ -2826,8 +2851,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     }
 
   #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-      max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
+    if constexpr (Utils::get_warp_size() == 64) {
+      max_logit = vllm::rocm::gfx906_wave_reduce_max<64>(max_logit);
+    } else {
+      for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+        max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
+      }
     }
 
     const float* exp_sums_ptr = exp_sums +
@@ -2858,8 +2887,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     }
 
   #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-      global_exp_sum += __shfl_xor(global_exp_sum, mask);
+    if constexpr (Utils::get_warp_size() == 64) {
+      global_exp_sum = vllm::rocm::gfx906_wave_reduce_sum<64>(global_exp_sum);
+    } else {
+      for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+        global_exp_sum += __shfl_xor(global_exp_sum, mask);
+      }
     }
     if (threadIdx.x == 0) {
       shared_global_exp_sum = global_exp_sum;
