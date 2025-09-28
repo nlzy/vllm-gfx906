@@ -52,6 +52,9 @@ The GPT-OSS series models are currently broken in the new version and will outpu
 
 Tested the GPTQ/AWQ MoE model and unquantized dense model, all worked.
 
+Add basic GLM4.5 MoE config (form upsteam) and Qwen3 MoE config (30B-A3B-2507)
+
+
 2025-09-12:
 
 Minor optimize in triton_unified_attention, reduce VRAM usage of AWQ
