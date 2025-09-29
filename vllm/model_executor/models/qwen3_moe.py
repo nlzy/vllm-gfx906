@@ -24,6 +24,7 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 import typing
 from collections.abc import Callable, Iterable
+from itertools import islice
 from typing import Any, Optional, Union
 
 import torch
@@ -124,11 +125,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # Load balancing settings.
         vllm_config = get_current_vllm_config()
-        parallel_config = vllm_config.parallel_config
+        eplb_config = vllm_config.parallel_config.eplb_config
         self.enable_eplb = enable_eplb
 
         self.n_logical_experts = self.n_routed_experts
-        self.n_redundant_experts = parallel_config.num_redundant_experts
+        self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_physical_experts = (self.n_logical_experts +
                                    self.n_redundant_experts)
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
@@ -142,7 +143,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                                 top_k=config.num_experts_per_tok,
                                 hidden_size=config.hidden_size,
                                 intermediate_size=config.moe_intermediate_size,
-                                reduce_results=False,
+                                reduce_results=True,
                                 renormalize=config.norm_topk_prob,
                                 quant_config=quant_config,
                                 prefix=f"{prefix}.experts",
@@ -165,8 +166,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         return quant_config
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # NOTE: hidden_states can have either 1D or 2D shape.
-        orig_shape = hidden_states.shape
+        assert hidden_states.dim(
+        ) <= 2, "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
+        is_input_1d = hidden_states.dim() == 1
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -175,11 +177,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         final_hidden_states = self.experts(hidden_states=hidden_states,
                                            router_logits=router_logits)
 
-        if self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
-                final_hidden_states)
-
-        return final_hidden_states.view(orig_shape)
+        # return to 1d if input is 1d
+        return final_hidden_states.squeeze(0) if is_input_1d else \
+            final_hidden_states
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -379,7 +379,8 @@ class Qwen3MoeModel(nn.Module):
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
         enable_eplb = parallel_config.enable_eplb
-        self.num_redundant_experts = parallel_config.num_redundant_experts
+        eplb_config = parallel_config.eplb_config
+        self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -423,8 +424,7 @@ class Qwen3MoeModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
