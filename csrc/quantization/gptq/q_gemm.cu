@@ -19,6 +19,10 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
 #include "qdq_4.cuh"
 #include "qdq_8.cuh"
 
+#if defined(USE_ROCM)
+#include "../../rocm/gfx906_utils.h"
+#endif
+
 namespace vllm {
 namespace gptq {
 
@@ -64,23 +68,43 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
 __forceinline__ __device__ half dot22_16_h(half2 (&dq)[8], const half* a_ptr,
                                            const half g_result,
                                            const half qs_h) {
-  half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
+#if defined(USE_ROCM)
+  float acc = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    vllm::rocm::gfx906_mad(acc, dq[i], *a2_ptr++);
+  }
+  const half result_h = __float2half(acc);
+  return __hfma(result_h, qs_h, g_result);
+#else
+  half2 result = {};
 #pragma unroll
   for (int i = 0; i < 8; i++) result = __hfma2(dq[i], *a2_ptr++, result);
   half result_h = __hadd(__low2half(result), __high2half(result));
   return __hfma(result_h, qs_h, g_result);
+#endif
 }
 
 __forceinline__ __device__ half dot22_32_h(half2 (&dq)[16], const half* a_ptr,
                                            const half g_result,
                                            const half qs_h) {
-  half2 result = {};
   const half2* a2_ptr = (const half2*)a_ptr;
+#if defined(USE_ROCM)
+  float acc = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 16; i++) {
+    vllm::rocm::gfx906_mad(acc, dq[i], *a2_ptr++);
+  }
+  const half result_h = __float2half(acc);
+  return __hfma(result_h, qs_h, g_result);
+#else
+  half2 result = {};
 #pragma unroll
   for (int i = 0; i < 16; i += 1) result = __hfma2(dq[i], *a2_ptr++, result);
   half result_h = __hadd(__low2half(result), __high2half(result));
   return __hfma(result_h, qs_h, g_result);
+#endif
 }
 
 typedef void (*fp_gemm_half_q_half_gptq_kernel)(const half*, const uint32_t*,

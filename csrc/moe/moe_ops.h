@@ -23,6 +23,7 @@ torch::Tensor moe_wna16_gemm(torch::Tensor input, torch::Tensor output,
                              int64_t BLOCK_SIZE_M, int64_t BLOCK_SIZE_N,
                              int64_t BLOCK_SIZE_K, int64_t bit);
 
+#ifndef USE_ROCM
 std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
     torch::Tensor const& scores, torch::Tensor const& scores_with_bias,
     int64_t n_group, int64_t topk_group, int64_t topk, bool renormalize,

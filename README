@@ -40,6 +40,21 @@ are slightly slow. Not recommended to use.
 NEWS
 -------------------
 
+2025-09-28:
+
+Update vLLM to v0.10.2
+
+Fix Qwen3Next Hybrid/Mmaba pathway worked.
+
+Optimized the gfx906 kernel, gain a little bit performance.
+
+The GPT-OSS series models are currently broken in the new version and will output garbage text, which needs further repair.
+
+Tested the GPTQ/AWQ MoE model and unquantized dense model, all worked.
+
+Add basic GLM4.5 MoE config (form upsteam) and Qwen3 MoE config (30B-A3B-2507)
+
+
 2025-09-12:
 
 Minor optimize in triton_unified_attention, reduce VRAM usage of AWQ

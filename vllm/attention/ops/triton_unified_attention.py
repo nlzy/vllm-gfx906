@@ -12,6 +12,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils import get_max_shared_memory_bytes
 
 logger = init_logger(__name__)
 float8_info = torch.finfo(current_platform.fp8_dtype())
@@ -77,6 +78,7 @@ def kernel_unified_attention_2d(
     output_stride_1: tl.int64,  # int, should be equal to head_size
     qq_bias_stride_0: tl.int64,  # int
     BLOCK_SIZE: tl.constexpr,  # int
+    BLOCK_FRAGMENT: tl.constexpr,  # int
     HEAD_SIZE: tl.constexpr,  # int
     HEAD_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
     USE_ALIBI_SLOPES: tl.constexpr,  # bool
@@ -97,6 +99,8 @@ def kernel_unified_attention_2d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    ACTUAL_BLOCK_SIZE: tl.int32,
+    USE_FRAGMENT_LOOP: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -184,110 +188,216 @@ def kernel_unified_attention_2d(
     # calculate the number of tiles (blocks) that need to be processed to
     # cover the longest sequence prefix (due to causal masking, blocks beyond
     # this prefix can be skipped)
-    num_blocks = cdiv_fn(max_seq_prefix_len, BLOCK_SIZE)
+    num_blocks = cdiv_fn(max_seq_prefix_len, ACTUAL_BLOCK_SIZE)
 
     # iterate through tiles
     for j in range(0, num_blocks):
 
         physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j)
 
-        offs_n = tl.arange(0, BLOCK_SIZE)
+        if not USE_FRAGMENT_LOOP:
+            offs_n = tl.arange(0, BLOCK_SIZE)
 
-        v_offset = (physical_block_idx * stride_v_cache_0 +
-                    kv_head_idx * stride_v_cache_2 +
-                    offs_d[None, :] * stride_v_cache_3 +
-                    offs_n[:, None] * stride_v_cache_1)
+            v_offset = (physical_block_idx * stride_v_cache_0 +
+                        kv_head_idx * stride_v_cache_2 +
+                        offs_d[None, :] * stride_v_cache_3 +
+                        offs_n[:, None] * stride_v_cache_1)
 
-        k_offset = (physical_block_idx * stride_k_cache_0 +
-                    kv_head_idx * stride_k_cache_2 +
-                    offs_d[:, None] * stride_k_cache_3 +
-                    offs_n[None, :] * stride_k_cache_1)
+            k_offset = (physical_block_idx * stride_k_cache_0 +
+                        kv_head_idx * stride_k_cache_2 +
+                        offs_d[:, None] * stride_k_cache_3 +
+                        offs_n[None, :] * stride_k_cache_1)
 
-        # K : (HEAD_SIZE, BLOCK_SIZE)
-        K_load = tl.load(key_cache_ptr + k_offset,
-                         mask=dim_mask[:, None],
-                         other=0.0)
+            # K : (HEAD_SIZE, BLOCK_SIZE)
+            K_load = tl.load(key_cache_ptr + k_offset,
+                             mask=dim_mask[:, None],
+                             other=0.0)
 
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
+            if K_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    K = K_load
+                else:
+                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+            else:
                 K = K_load
+
+            # V : (BLOCK_SIZE, HEAD_SIZE)
+            V_load = tl.load(value_cache_ptr + v_offset,
+                             mask=dim_mask[None, :],
+                             other=0.0)
+
+            if V_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    V = V_load
+                else:
+                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
             else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-        else:
-            K = K_load
-
-        # V : (BLOCK_SIZE, HEAD_SIZE)
-        V_load = tl.load(value_cache_ptr + v_offset,
-                         mask=dim_mask[None, :],
-                         other=0.0)
-
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
                 V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+
+            seq_offset = j * ACTUAL_BLOCK_SIZE + offs_n
+
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+
+            # S : (BLOCK_M, BLOCK_SIZE)
+            S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+
+            S += scale * tl.dot(Q, K)
+
+            if USE_SOFTCAP:
+                S = apply_softcap(S, softcap)
+
+            S = tl.where(query_mask_1[:, None] & query_mask_0[:, None]
+                         & seq_mask,
+                         S,
+                         float("-inf"))
+
+            if SLIDING_WINDOW > 0:
+                S = tl.where((context_len + query_pos[:, None] - seq_offset)
+                             < SLIDING_WINDOW,
+                             S,
+                             float("-inf"))
+
+            if USE_ALIBI_SLOPES:
+                S += alibi_slope[:, None] * (seq_offset - context_len)
+
+            if USE_QQ_BIAS:
+                key_rel_pos = seq_offset - context_len
+                is_query_key = (key_rel_pos >= 0) & (key_rel_pos <
+                                                     qq_bias_stride_0)
+                qq_bias = tl.load(
+                    qq_bias_row_ptrs + key_rel_pos[None, :],
+                    mask=is_query_key[None, :],
+                    other=0.0,
+                )
+                S += qq_bias
+
+            m_j = tl.maximum(M, tl.max(S, axis=1))
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+            P = tl.exp(S - m_j[:, None])
+
+            l_j = tl.sum(P, axis=1)
+
+            alpha = tl.exp(M - m_j)
+
+            acc = acc * alpha[:, None]
+
+            L = L * alpha + l_j
+            M = m_j
+
+            acc += tl.dot(P.to(V.dtype), V)
+
         else:
-            V = V_load
+            chunk_start = 0
+            while chunk_start < ACTUAL_BLOCK_SIZE:
+                offs_n = chunk_start + tl.arange(0, BLOCK_FRAGMENT)
+                block_mask = offs_n < ACTUAL_BLOCK_SIZE
+                mask_has_values = tl.sum(block_mask, axis=0) != 0
 
-        seq_offset = j * BLOCK_SIZE + offs_n
+                if mask_has_values:
+                    offs_n_i64 = offs_n.to(tl.int64)
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+                    v_offset = (physical_block_idx * stride_v_cache_0 +
+                                kv_head_idx * stride_v_cache_2 +
+                                offs_d[None, :] * stride_v_cache_3 +
+                                offs_n_i64[:, None] * stride_v_cache_1)
 
-        # S : (BLOCK_M, BLOCK_SIZE)
-        S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+                    k_offset = (physical_block_idx * stride_k_cache_0 +
+                                kv_head_idx * stride_k_cache_2 +
+                                offs_d[:, None] * stride_k_cache_3 +
+                                offs_n_i64[None, :] * stride_k_cache_1)
 
-        S += scale * tl.dot(Q, K)
+                    # K : (HEAD_SIZE, BLOCK_FRAGMENT)
+                    K_load = tl.load(
+                        key_cache_ptr + k_offset,
+                        mask=dim_mask[:, None] & block_mask[None, :],
+                        other=0.0,
+                    )
 
-        if USE_SOFTCAP:
-            S = apply_softcap(S, softcap)
+                    if K_load.dtype.is_fp8():
+                        if Q.dtype.is_fp8():
+                            K = K_load
+                        else:
+                            K = (K_load.to(tl.float32) * tl.load(k_scale)).to(
+                                Q.dtype)
+                    else:
+                        K = K_load
 
-        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
-                     S, float("-inf"))
+                    # V : (BLOCK_FRAGMENT, HEAD_SIZE)
+                    V_load = tl.load(
+                        value_cache_ptr + v_offset,
+                        mask=block_mask[:, None] & dim_mask[None, :],
+                        other=0.0,
+                    )
 
-        if SLIDING_WINDOW > 0:
-            S = tl.where((context_len + query_pos[:, None] - seq_offset)
-                         < SLIDING_WINDOW, S, float("-inf"))
+                    if V_load.dtype.is_fp8():
+                        if Q.dtype.is_fp8():
+                            V = V_load
+                        else:
+                            V = (V_load.to(tl.float32) * tl.load(v_scale)).to(
+                                Q.dtype)
+                    else:
+                        V = V_load
 
-        if USE_ALIBI_SLOPES:
-            S += alibi_slope[:, None] * (seq_offset - context_len)
+                    seq_offset = j * ACTUAL_BLOCK_SIZE + offs_n
 
-        if USE_QQ_BIAS:
-            # compute key positions relative to query section
-            key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
-            # load bias only for keys that correspond to queries
-            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-            qq_bias = tl.load(
-                qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
-                other=0.0,
-            )
-            S += qq_bias
+                    seq_mask = block_mask[None, :] & (seq_offset[None, :] <
+                                                      context_len +
+                                                      query_pos[:, None] + 1)
 
-        # compute running maximum
-        # m_j : (BLOCK_M,)
-        m_j = tl.maximum(M, tl.max(S, axis=1))
-        # For sliding window there's a chance the max is -inf due to masking of
-        # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+                    # S : (BLOCK_M, BLOCK_FRAGMENT)
+                    S = tl.zeros(shape=(BLOCK_M, BLOCK_FRAGMENT),
+                                 dtype=tl.float32)
 
-        # P : (BLOCK_M, BLOCK_SIZE)
-        P = tl.exp(S - m_j[:, None])
+                    S += scale * tl.dot(Q, K)
 
-        # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
+                    S = tl.where(block_mask[None, :], S, float("-inf"))
 
-        # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+                    if USE_SOFTCAP:
+                        S = apply_softcap(S, softcap)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = acc * alpha[:, None]
+                    S = tl.where(query_mask_1[:, None] & query_mask_0[:, None]
+                                 & seq_mask,
+                                 S,
+                                 float("-inf"))
 
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
+                    if SLIDING_WINDOW > 0:
+                        S = tl.where((context_len + query_pos[:, None] -
+                                      seq_offset) < SLIDING_WINDOW,
+                                     S,
+                                     float("-inf"))
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+                    if USE_ALIBI_SLOPES:
+                        S += alibi_slope[:, None] * (seq_offset - context_len)
+
+                    if USE_QQ_BIAS:
+                        key_rel_pos = seq_offset - context_len
+                        is_query_key = block_mask & (key_rel_pos >= 0) & \
+                            (key_rel_pos < qq_bias_stride_0)
+                        qq_bias = tl.load(
+                            qq_bias_row_ptrs + key_rel_pos[None, :],
+                            mask=is_query_key[None, :],
+                            other=0.0,
+                        )
+                        S += qq_bias
+
+                    m_j = tl.maximum(M, tl.max(S, axis=1))
+                    m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+                    P = tl.exp(S - m_j[:, None])
+
+                    l_j = tl.sum(P, axis=1)
+
+                    alpha = tl.exp(M - m_j)
+
+                    acc = acc * alpha[:, None]
+
+                    L = L * alpha + l_j
+                    M = m_j
+
+                    acc += tl.dot(P.to(V.dtype), V)
+
+                chunk_start += BLOCK_FRAGMENT
 
     # epilogue
     acc = acc / L[:, None]
@@ -335,6 +445,7 @@ def kernel_unified_attention_3d(
         query_stride_1: tl.int64,  # int, should be equal to head_size
         qq_bias_stride_0: tl.int64,  # int
         BLOCK_SIZE: tl.constexpr,  # int
+        BLOCK_FRAGMENT: tl.constexpr,  # int
         HEAD_SIZE: tl.constexpr,  # int
         HEAD_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
         USE_ALIBI_SLOPES: tl.constexpr,  # bool
@@ -355,6 +466,8 @@ def kernel_unified_attention_3d(
         num_seqs: tl.int32,
         BLOCK_M: tl.constexpr,  # int
         NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+        ACTUAL_BLOCK_SIZE: tl.int32,
+        USE_FRAGMENT_LOOP: tl.constexpr,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -382,9 +495,9 @@ def kernel_unified_attention_3d(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    blocks_per_segment = cdiv_fn(seq_len, num_segments * BLOCK_SIZE)
+    blocks_per_segment = cdiv_fn(seq_len, num_segments * ACTUAL_BLOCK_SIZE)
 
-    if segm_idx * blocks_per_segment * BLOCK_SIZE >= seq_len:
+    if segm_idx * blocks_per_segment * ACTUAL_BLOCK_SIZE >= seq_len:
         return
 
     offs_m = tl.arange(0, BLOCK_M)
@@ -441,7 +554,7 @@ def kernel_unified_attention_3d(
         qq_bias_row_ptrs = (qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
                             )  # shape: [BLOCK_M]
 
-    num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
+    num_blocks = cdiv_fn(seq_len, ACTUAL_BLOCK_SIZE)
 
     # iterate through tiles within current segment
     for j in range(
@@ -450,103 +563,198 @@ def kernel_unified_attention_3d(
     ):
         physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j)
 
-        offs_n = tl.arange(0, BLOCK_SIZE)
+        if not USE_FRAGMENT_LOOP:
+            offs_n = tl.arange(0, BLOCK_SIZE)
 
-        v_offset = (physical_block_idx * stride_v_cache_0 +
-                    kv_head_idx * stride_v_cache_2 +
-                    offs_d[None, :] * stride_v_cache_3 +
-                    offs_n[:, None] * stride_v_cache_1)
+            v_offset = (physical_block_idx * stride_v_cache_0 +
+                        kv_head_idx * stride_v_cache_2 +
+                        offs_d[None, :] * stride_v_cache_3 +
+                        offs_n[:, None] * stride_v_cache_1)
 
-        k_offset = (physical_block_idx * stride_k_cache_0 +
-                    kv_head_idx * stride_k_cache_2 +
-                    offs_d[:, None] * stride_k_cache_3 +
-                    offs_n[None, :] * stride_k_cache_1)
+            k_offset = (physical_block_idx * stride_k_cache_0 +
+                        kv_head_idx * stride_k_cache_2 +
+                        offs_d[:, None] * stride_k_cache_3 +
+                        offs_n[None, :] * stride_k_cache_1)
 
-        # K : (HEAD_SIZE, BLOCK_SIZE)
-        K_load = tl.load(key_cache_ptr + k_offset,
-                         mask=dim_mask[:, None],
-                         other=0.0)
+            K_load = tl.load(key_cache_ptr + k_offset,
+                             mask=dim_mask[:, None],
+                             other=0.0)
 
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
+            if K_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    K = K_load
+                else:
+                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+            else:
                 K = K_load
+
+            V_load = tl.load(value_cache_ptr + v_offset,
+                             mask=dim_mask[None, :],
+                             other=0.0)
+
+            if V_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    V = V_load
+                else:
+                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
             else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-        else:
-            K = K_load
-
-        # V : (BLOCK_SIZE, HEAD_SIZE)
-        V_load = tl.load(value_cache_ptr + v_offset,
-                         mask=dim_mask[None, :],
-                         other=0.0)
-
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
                 V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+
+            seq_offset = j * ACTUAL_BLOCK_SIZE + offs_n
+
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+
+            S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+            S += scale * tl.dot(Q, K)
+
+            if USE_SOFTCAP:
+                S = apply_softcap(S, softcap)
+
+            mask = query_mask_1[:, None] & query_mask_0[:, None] & seq_mask
+            S = tl.where(mask, S, float("-inf"))
+
+            if SLIDING_WINDOW > 0:
+                S = tl.where((context_len + query_pos[:, None] - seq_offset)
+                             < SLIDING_WINDOW,
+                             S,
+                             float("-inf"))
+
+            if USE_ALIBI_SLOPES:
+                S += alibi_slope[:, None] * (seq_offset - context_len)
+
+            if USE_QQ_BIAS:
+                key_rel_pos = seq_offset - context_len
+                is_query_key = (key_rel_pos >= 0) & (key_rel_pos <
+                                                     qq_bias_stride_0)
+                qq_bias = tl.load(
+                    qq_bias_row_ptrs + key_rel_pos[None, :],
+                    mask=is_query_key[None, :],
+                    other=0.0,
+                )
+                S += qq_bias
+
+            m_j = tl.maximum(M, tl.max(S, axis=1))
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+            P = tl.exp(S - m_j[:, None])
+
+            l_j = tl.sum(P, axis=1)
+
+            alpha = tl.exp(M - m_j)
+
+            acc = acc * alpha[:, None]
+
+            L = L * alpha + l_j
+            M = m_j
+
+            acc += tl.dot(P.to(V.dtype), V)
+
         else:
-            V = V_load
+            chunk_start = 0
+            while chunk_start < ACTUAL_BLOCK_SIZE:
+                offs_n = chunk_start + tl.arange(0, BLOCK_FRAGMENT)
+                block_mask = offs_n < ACTUAL_BLOCK_SIZE
+                mask_has_values = tl.sum(block_mask, axis=0) != 0
 
-        seq_offset = j * BLOCK_SIZE + offs_n
+                if mask_has_values:
+                    offs_n_i64 = offs_n.to(tl.int64)
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+                    v_offset = (physical_block_idx * stride_v_cache_0 +
+                                kv_head_idx * stride_v_cache_2 +
+                                offs_d[None, :] * stride_v_cache_3 +
+                                offs_n_i64[:, None] * stride_v_cache_1)
 
-        # S : (BLOCK_M, BLOCK_SIZE)
-        S = tl.zeros(shape=(BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+                    k_offset = (physical_block_idx * stride_k_cache_0 +
+                                kv_head_idx * stride_k_cache_2 +
+                                offs_d[:, None] * stride_k_cache_3 +
+                                offs_n_i64[None, :] * stride_k_cache_1)
 
-        S += scale * tl.dot(Q, K)
+                    K_load = tl.load(
+                        key_cache_ptr + k_offset,
+                        mask=dim_mask[:, None] & block_mask[None, :],
+                        other=0.0,
+                    )
 
-        if USE_SOFTCAP:
-            S = apply_softcap(S, softcap)
+                    if K_load.dtype.is_fp8():
+                        if Q.dtype.is_fp8():
+                            K = K_load
+                        else:
+                            K = (K_load.to(tl.float32) * tl.load(k_scale)).to(
+                                Q.dtype)
+                    else:
+                        K = K_load
 
-        S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
-                     S, float("-inf"))
+                    V_load = tl.load(
+                        value_cache_ptr + v_offset,
+                        mask=block_mask[:, None] & dim_mask[None, :],
+                        other=0.0,
+                    )
 
-        if SLIDING_WINDOW > 0:
-            S = tl.where((context_len + query_pos[:, None] - seq_offset)
-                         < SLIDING_WINDOW, S, float("-inf"))
+                    if V_load.dtype.is_fp8():
+                        if Q.dtype.is_fp8():
+                            V = V_load
+                        else:
+                            V = (V_load.to(tl.float32) * tl.load(v_scale)).to(
+                                Q.dtype)
+                    else:
+                        V = V_load
 
-        if USE_ALIBI_SLOPES:
-            S += alibi_slope[:, None] * (seq_offset - context_len)
+                    seq_offset = j * ACTUAL_BLOCK_SIZE + offs_n
 
-        if USE_QQ_BIAS:
-            # compute key positions relative to query section
-            key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
-            # load bias only for keys that correspond to queries
-            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-            qq_bias = tl.load(
-                qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
-                other=0.0,
-            )
-            S += qq_bias
+                    seq_mask = block_mask[None, :] & (seq_offset[None, :] <
+                                                      context_len +
+                                                      query_pos[:, None] + 1)
 
-        # compute running maximum
-        # m_j : (BLOCK_M,)
-        m_j = tl.maximum(M, tl.max(S, axis=1))
-        # For sliding window there's a chance the max is -inf due to masking of
-        # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+                    S = tl.zeros(shape=(BLOCK_M, BLOCK_FRAGMENT),
+                                 dtype=tl.float32)
 
-        # P : (BLOCK_M, BLOCK_SIZE,)
-        P = tl.exp(S - m_j[:, None])
+                    S += scale * tl.dot(Q, K)
 
-        # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
+                    S = tl.where(block_mask[None, :], S, float("-inf"))
 
-        # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+                    if USE_SOFTCAP:
+                        S = apply_softcap(S, softcap)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = acc * alpha[:, None]
+                    mask = query_mask_1[:, None] & query_mask_0[:, None] & seq_mask
+                    S = tl.where(mask, S, float("-inf"))
 
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
+                    if SLIDING_WINDOW > 0:
+                        S = tl.where((context_len + query_pos[:, None] -
+                                      seq_offset) < SLIDING_WINDOW,
+                                     S,
+                                     float("-inf"))
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+                    if USE_ALIBI_SLOPES:
+                        S += alibi_slope[:, None] * (seq_offset - context_len)
+
+                    if USE_QQ_BIAS:
+                        key_rel_pos = seq_offset - context_len
+                        is_query_key = block_mask & (key_rel_pos >= 0) & \
+                            (key_rel_pos < qq_bias_stride_0)
+                        qq_bias = tl.load(
+                            qq_bias_row_ptrs + key_rel_pos[None, :],
+                            mask=is_query_key[None, :],
+                            other=0.0,
+                        )
+                        S += qq_bias
+
+                    m_j = tl.maximum(M, tl.max(S, axis=1))
+                    m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+                    P = tl.exp(S - m_j[:, None])
+
+                    l_j = tl.sum(P, axis=1)
+
+                    alpha = tl.exp(M - m_j)
+
+                    acc = acc * alpha[:, None]
+
+                    L = L * alpha + l_j
+                    M = m_j
+
+                    acc += tl.dot(P.to(V.dtype), V)
+
+                chunk_start += BLOCK_FRAGMENT
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64) *
@@ -693,16 +901,43 @@ def unified_attention(
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
 
-    block_size = v.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+    head_size_padded = triton.next_power_of_2(head_size)
 
     BLOCK_M = 16 if num_queries_per_kv <= 16 else triton.next_power_of_2(
         num_queries_per_kv)
     BLOCK_Q = BLOCK_M // num_queries_per_kv
+
+    block_fragment = min(triton.next_power_of_2(block_size), 256)
+
+    if current_platform.is_rocm():
+        max_shared = 0
+        try:
+            max_shared = get_max_shared_memory_bytes()
+        except Exception:
+            max_shared = 64 * 1024
+
+        if max_shared > 0:
+            kv_bytes = max(k.element_size(), v.element_size())
+            kv_bytes = max(kv_bytes, 1)
+
+            # conservative shared memory estimate per iteration
+            def estimate_shared(fragment: int) -> int:
+                shared = 0
+                shared += 2 * head_size_padded * fragment * kv_bytes
+                shared += 2 * BLOCK_M * fragment * 4
+                return shared
+
+            # keep block_fragment as power of two while respecting limit
+            while (block_fragment > 32 and
+                   estimate_shared(block_fragment) > max_shared):
+                block_fragment //= 2
+
+    use_fragment_loop = block_fragment < block_size
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -715,8 +950,24 @@ def unified_attention(
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
+    if current_platform.is_rocm():
+        # Keep the faster 2D kernel for very small decode batches to avoid the
+        # expensive segmented 3D compilation, but fall back to 3D once there is
+        # enough parallelism or context length to benefit from it.
+        ROCM_MIN_DECODE_TOKENS_FOR_3D = 4
+        ROCM_MIN_CONTEXT_FOR_3D = 256
+        long_context = max_seqlen_k >= ROCM_MIN_CONTEXT_FOR_3D
+        decode_ready = (max_seqlen_q <= 1
+                        and total_num_q_blocks * num_kv_heads <= 128
+                        and (q.shape[0] >= ROCM_MIN_DECODE_TOKENS_FOR_3D
+                             or long_context))
+        use_3d_kernel = decode_ready
+    else:
+        use_3d_kernel = (max_seqlen_q <= 1 and
+                         total_num_q_blocks * num_kv_heads <= 128)
+
     # if batch contains a prefill
-    if max_seqlen_q > 1 or total_num_q_blocks * num_kv_heads > 128:
+    if not use_3d_kernel:
         kernel_unified_attention_2d[(
             total_num_q_blocks,
             num_kv_heads,
@@ -744,8 +995,9 @@ def unified_attention(
             output_stride_1=out.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
+            BLOCK_FRAGMENT=block_fragment,
             HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE_PADDED=head_size_padded,
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -764,6 +1016,8 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            ACTUAL_BLOCK_SIZE=block_size,
+            USE_FRAGMENT_LOOP=use_fragment_loop,
         )
     else:
         # for initial version, NUM_SEGMENTS = 16 is chosen as a default
@@ -774,7 +1028,7 @@ def unified_attention(
             q.shape[0],
             num_query_heads,
             NUM_SEGMENTS,
-            triton.next_power_of_2(head_size),
+            head_size_padded,
             dtype=torch.float32,
             device=q.device,
         )
@@ -817,8 +1071,9 @@ def unified_attention(
                 query_stride_1=q.stride(1),
                 qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
                 BLOCK_SIZE=block_size,
+                BLOCK_FRAGMENT=block_fragment,
                 HEAD_SIZE=head_size,
-                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                HEAD_SIZE_PADDED=head_size_padded,
                 USE_ALIBI_SLOPES=use_alibi_slopes,
                 USE_QQ_BIAS=use_qq_bias,
                 USE_SOFTCAP=(softcap > 0),
@@ -837,6 +1092,8 @@ def unified_attention(
                 num_seqs=num_seqs,
                 BLOCK_M=BLOCK_M,
                 NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
+                ACTUAL_BLOCK_SIZE=block_size,
+                USE_FRAGMENT_LOOP=use_fragment_loop,
             )
 
         reduce_segments[(q.shape[0], num_query_heads)](
@@ -854,7 +1111,7 @@ def unified_attention(
             block_table_stride=block_table.stride(0),
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE_PADDED=head_size_padded,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,

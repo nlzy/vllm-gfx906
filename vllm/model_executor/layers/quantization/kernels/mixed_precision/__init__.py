@@ -26,6 +26,7 @@ from vllm.platforms import current_platform
 
 # in priority/performance order (when available)
 _POSSIBLE_KERNELS: list[type[MPLinearKernel]] = [
+    # CutlassW4A8LinearKernel,
     # MacheteLinearKernel,
     # AllSparkLinearKernel,
     # MarlinLinearKernel,

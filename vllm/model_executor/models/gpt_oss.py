@@ -27,6 +27,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from vllm.utils import cdiv
+from vllm.platforms import current_platform
 
 from .interfaces import SupportsPP
 from .utils import (AutoWeightsLoader, WeightsMapper, extract_layer_index,
@@ -146,7 +147,7 @@ class MLPBlock(torch.nn.Module):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         self.router = torch.nn.Linear(config.hidden_size,
                                       config.num_local_experts,
-                                      dtype=torch.bfloat16)
+                                      dtype=router_dtype)
         assert config.intermediate_size % self.world_size == 0
         self.experts = FusedMoE(num_experts=config.num_local_experts,
                                 top_k=config.num_experts_per_tok,

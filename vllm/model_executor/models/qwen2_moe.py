@@ -72,17 +72,24 @@ class Qwen2MoeMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
+        gate_prefix = maybe_prefix(prefix, "gate_up_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2,
+            hidden_size,
+            [intermediate_size] * 2,
             bias=False,
-            quant_config=quant_config)
+            quant_config=quant_config,
+            prefix=gate_prefix,
+        )
+        down_prefix = maybe_prefix(prefix, "down_proj")
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
                                            quant_config=quant_config,
-                                           reduce_results=reduce_results)
+                                           reduce_results=reduce_results,
+                                           prefix=down_prefix)
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
@@ -125,6 +132,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                                      bias=False,
                                      quant_config=None)
         if config.shared_expert_intermediate_size > 0:
+            shared_prefix = maybe_prefix(prefix, "shared_expert")
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -132,6 +140,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=self.experts.must_reduce_shared_expert_outputs(
                 ),
+                prefix=shared_prefix,
             )
         else:
             self.shared_expert = None
@@ -296,11 +305,13 @@ class Qwen2MoeDecoderLayer(nn.Module):
                                               quant_config=quant_config,
                                               prefix=f"{prefix}.mlp")
         else:
+            mlp_prefix = maybe_prefix(prefix, "mlp")
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                prefix=mlp_prefix,
             )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)

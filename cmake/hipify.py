@@ -63,10 +63,25 @@ if __name__ == '__main__':
     hipified_sources = []
     for source in args.sources:
         s_abs = os.path.abspath(source)
-        hipified_s_abs = (hipify_result[s_abs].hipified_path if
-                          (s_abs in hipify_result
-                           and hipify_result[s_abs].hipified_path is not None)
-                          else s_abs)
+        hipified_s_abs = None
+        if s_abs in hipify_result:
+            hipified_s_abs = hipify_result[s_abs].hipified_path
+
+        if hipified_s_abs is None:
+            # hipify may decide that the source does not need any edits. However,
+            # our build expects a hipified translation unit with a `.hip`
+            # extension to exist in the build tree. Create one by copying the
+            # original file into the mirrored build directory with the expected
+            # name.
+            rel_path = os.path.relpath(s_abs, args.project_dir)
+            hip_rel = rel_path.replace("cuda", "hip")
+            if hip_rel.endswith(".cu"):
+                hip_rel = hip_rel[:-3] + ".hip"
+            hip_abs = os.path.abspath(os.path.join(args.output_dir, hip_rel))
+            os.makedirs(os.path.dirname(hip_abs), exist_ok=True)
+            shutil.copy2(os.path.join(args.output_dir, rel_path), hip_abs)
+            hipified_s_abs = hip_abs
+
         hipified_sources.append(hipified_s_abs)
 
     assert (len(hipified_sources) == len(args.sources))

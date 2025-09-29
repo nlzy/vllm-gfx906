@@ -131,11 +131,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate")
 
         if config.shared_expert_intermediate_size > 0:
+            shared_prefix = maybe_prefix(prefix, "shared_expert")
             self.shared_expert = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                prefix=shared_prefix,
                 reduce_results=self.experts.must_reduce_shared_expert_outputs(
                 ),
             )
@@ -786,11 +788,13 @@ class Qwen3NextDecoderLayer(nn.Module):
                 enable_eplb=enable_eplb,
             )
         else:
+            mlp_prefix = maybe_prefix(prefix, "mlp")
             self.mlp = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                prefix=mlp_prefix,
             )
 
         self.input_layernorm = Qwen3NextRMSNorm(config.hidden_size,
@@ -984,9 +988,45 @@ class Qwen3NextModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+
+        def resolve_param(name: str
+                          ) -> tuple[Optional[str], Optional[torch.nn.Parameter]]:
+            if name in params_dict:
+                return name, params_dict[name]
+
+            if name.endswith('.weight'):
+                base = name[: -len('.weight')]
+                candidate_suffixes = (
+                    '.weight_packed',
+                    '.qweight',
+                    '.weight_q',
+                    '.w1_weight',
+                    '.w2_weight',
+                    '.w13_weight',
+                    '.w1_weight_packed',
+                    '.w2_weight_packed',
+                    '.w13_weight_packed',
+                )
+                for suffix in candidate_suffixes:
+                    candidate = base + suffix
+                    if candidate in params_dict:
+                        return candidate, params_dict[candidate]
+
+                # Fall back to a heuristic search so we can support future
+                # compressed-tensor parameter names without enumerating them
+                # ahead of time.
+                prefix = base + '.'
+                for candidate in params_dict:
+                    if candidate.startswith(prefix) and candidate.endswith(
+                            ('weight_packed', 'qweight', 'weight_q',
+                             'w1_weight', 'w2_weight', 'w13_weight')):
+                        return candidate, params_dict[candidate]
+
+            return None, None
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         for name, loaded_weight in weights:
+            orig_name = name
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -1008,11 +1048,35 @@ class Qwen3NextModel(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
                 # name = apply_attn_prefix(name, params_dict)
-                if name not in params_dict:
+                resolved_name, param = resolve_param(name)
+                if param is None:
                     continue
-                param = params_dict[name]
+                name = resolved_name
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                try:
+                    weight_loader(param, loaded_weight, shard_id)
+                except Exception:
+                    param_shape = (tuple(param.data.shape)
+                                   if hasattr(param, "data")
+                                   and isinstance(param.data, torch.Tensor)
+                                   else None)
+                    param_dtype = (param.data.dtype if hasattr(param, "data")
+                                   and isinstance(param.data, torch.Tensor)
+                                   else None)
+                    logger.error(
+                        "Failed to load weight %s (resolved to %s) with shard %s;"
+                        " param_type=%s param_shape=%s param_dtype=%s"
+                        " loaded_shape=%s loaded_dtype=%s",
+                        orig_name,
+                        name,
+                        shard_id,
+                        type(param).__name__,
+                        param_shape,
+                        param_dtype,
+                        tuple(loaded_weight.shape),
+                        loaded_weight.dtype,
+                    )
+                    raise
                 break
             else:
                 for mapping in expert_params_mapping:
@@ -1027,13 +1091,42 @@ class Qwen3NextModel(nn.Module):
                     if ((name.endswith(".bias") or name.endswith("_bias"))
                             and name not in params_dict):
                         continue
-                    param = params_dict[name]
+                    resolved_name, param = resolve_param(name)
+                    if param is None:
+                        continue
+                    name = resolved_name
                     weight_loader = param.weight_loader
-                    weight_loader(param,
-                                  loaded_weight,
-                                  name,
-                                  shard_id=shard_id,
-                                  expert_id=expert_id)
+                    try:
+                        weight_loader(param,
+                                      loaded_weight,
+                                      name,
+                                      shard_id=shard_id,
+                                      expert_id=expert_id)
+                    except Exception:
+                        param_shape = (tuple(param.data.shape)
+                                       if hasattr(param, "data")
+                                       and isinstance(param.data, torch.Tensor)
+                                       else None)
+                        param_dtype = (param.data.dtype
+                                       if hasattr(param, "data")
+                                       and isinstance(param.data,
+                                                      torch.Tensor) else None)
+                        logger.error(
+                            "Failed to load MoE weight %s (resolved to %s);"
+                            " shard_id=%s expert_id=%s param_type=%s"
+                            " param_shape=%s param_dtype=%s"
+                            " loaded_shape=%s loaded_dtype=%s",
+                            orig_name,
+                            name,
+                            shard_id,
+                            expert_id,
+                            type(param).__name__,
+                            param_shape,
+                            param_dtype,
+                            tuple(loaded_weight.shape),
+                            loaded_weight.dtype,
+                        )
+                        raise
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
@@ -1041,10 +1134,36 @@ class Qwen3NextModel(nn.Module):
                         continue
                     if is_pp_missing_parameter(name, self):
                         continue
-                    param = params_dict[name]
+                    resolved_name, param = resolve_param(name)
+                    if param is None:
+                        raise KeyError(name)
+                    name = resolved_name
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
-                    weight_loader(param, loaded_weight)
+                    try:
+                        weight_loader(param, loaded_weight)
+                    except Exception:
+                        param_shape = (tuple(param.data.shape)
+                                       if hasattr(param, "data")
+                                       and isinstance(param.data,
+                                                      torch.Tensor) else None)
+                        param_dtype = (param.data.dtype
+                                       if hasattr(param, "data")
+                                       and isinstance(param.data,
+                                                      torch.Tensor) else None)
+                        logger.error(
+                            "Failed to load weight %s (resolved to %s);"
+                            " param_type=%s param_shape=%s param_dtype=%s"
+                            " loaded_shape=%s loaded_dtype=%s",
+                            orig_name,
+                            name,
+                            type(param).__name__,
+                            param_shape,
+                            param_dtype,
+                            tuple(loaded_weight.shape),
+                            loaded_weight.dtype,
+                        )
+                        raise
             loaded_params.add(name)
         return loaded_params
 

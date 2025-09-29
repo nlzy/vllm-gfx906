@@ -357,6 +357,7 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
+        compilation_config = vllm_config.compilation_config
 
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype

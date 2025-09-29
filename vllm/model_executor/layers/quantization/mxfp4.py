@@ -123,7 +123,10 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16]
+        dtypes = [torch.bfloat16]
+        if torch.float16 in current_platform.supported_dtypes:
+            dtypes.append(torch.float16)
+        return dtypes
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
