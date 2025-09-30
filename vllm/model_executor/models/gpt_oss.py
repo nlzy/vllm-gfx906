@@ -145,6 +145,9 @@ class MLPBlock(torch.nn.Module):
         self.num_experts = config.num_local_experts
         self.experts_per_token = config.num_experts_per_tok
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        router_dtype = torch.bfloat16
+        if router_dtype not in current_platform.supported_dtypes:
+            router_dtype = torch.float16
         self.router = torch.nn.Linear(config.hidden_size,
                                       config.num_local_experts,
                                       dtype=router_dtype)

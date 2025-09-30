@@ -40,6 +40,11 @@ are slightly slow. Not recommended to use.
 NEWS
 -------------------
 
+2025-09-30:
+
+Fixed GPT-OSS series models output garbage text issue.
+
+
 2025-09-28:
 
 Update vLLM to v0.10.2
@@ -190,11 +195,13 @@ cd vllm-gfx906
 python3 -m venv vllmenv
 source vllmenv/bin/activate
 
-pip3 install 'torch==2.7' torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
+pip3 install 'torch==2.8' torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
 pip3 install -r requirements/rocm-build.txt
 pip3 install -r requirements/rocm.txt
 
 pip3 install --no-build-isolation .
+pip3 install git+https://github.com/huggingface/transformers.git@main (for Qwen3Next Support)
+pip3 install amd-quark (for GPT-OSS Support)
 ```
 
 
