@@ -675,7 +675,13 @@ def get_config_file_name(E: int,
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = ("" if not block_shape or not all(block_shape) else
                             f",block_shape={block_shape}").replace(" ", "")
-    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
+    file_name = f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
+    # Ensure file name does not create unintended directories regardless of
+    # platform specific separators.
+    file_name = file_name.replace(os.sep, "_")
+    file_name = file_name.replace("/", "_")
+    file_name = file_name.replace("\\", "_")
+    return file_name
 
 
 # Adapted from: https://github.com/sgl-project/sglang/pull/2628
@@ -700,11 +706,6 @@ def get_moe_configs(
     # directory
     block_shape = [block_n, block_k] if block_n and block_k else None
     json_file_name = get_config_file_name(E, N, dtype, block_shape)
-    # Keep MI50 configs alongside others instead of nested directories.
-    json_file_name = json_file_name.replace("/", "_")
-
-    # We replace / so that AMD MI50/MI60 -> AMD MI50_MI60, does not need subdir
-    json_file_name = json_file_name.replace("/","_")
 
     config_file_paths = []
 
