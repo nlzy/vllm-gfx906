@@ -9,7 +9,7 @@ import triton.language as tl
 
 from vllm import _custom_ops as ops
 from vllm import envs
-from vllm.platforms import current_platform
+from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils import direct_register_custom_op
 
 
@@ -249,9 +249,7 @@ def rocm_unquantized_gemm(layer: torch.nn.Module,
 direct_register_custom_op(
     op_name="rocm_unquantized_gemm_impl",
     op_func=rocm_unquantized_gemm_impl,
-    mutates_args=[],
     fake_impl=rocm_unquantized_gemm_impl_fake,
-    dispatch_key=current_platform.dispatch_key,
 )
 
 
@@ -280,7 +278,8 @@ def dispatch_cpu_unquantized_gemm(
         if remove_weight:
             layer.weight = torch.nn.Parameter(torch.empty(0),
                                               requires_grad=False)
-    elif ops._supports_onednn:
+    elif (ops._supports_onednn
+          and current_platform.get_cpu_architecture() == CpuArchEnum.X86):
         origin_weight = layer.weight
         if remove_weight:
             layer.weight = torch.nn.Parameter(torch.empty(0),
