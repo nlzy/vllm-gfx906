@@ -675,6 +675,9 @@ def get_config_file_name(E: int,
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = ("" if not block_shape or not all(block_shape) else
                             f",block_shape={block_shape}").replace(" ", "")
+    gfx906_names = [ "Instinct_MI50", "Instinct_MI60", "Radeon_Pro_VII", "Radeon_VII" ]
+    if any(s in device_name for s in gfx906_names):
+        device_name = "AMD_GFX906"
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
 
 
@@ -700,9 +703,6 @@ def get_moe_configs(
     # directory
     block_shape = [block_n, block_k] if block_n and block_k else None
     json_file_name = get_config_file_name(E, N, dtype, block_shape)
-
-    # We replace / so that AMD MI50/MI60 -> AMD MI50_MI60, does not need subdir
-    json_file_name = json_file_name.replace("/","_")
 
     config_file_paths = []
 
