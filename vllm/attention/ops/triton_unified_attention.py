@@ -751,8 +751,14 @@ def unified_attention(
     # Assigning default tile sizes for prefill and decode.
     # Note: each tile size must be at least 32 for "fp8" (q.element_size() == 1)
     # and at least 16 for all other data types.
-    TILE_SIZE_PREFILL = 32
-    TILE_SIZE_DECODE = 16 if q.element_size() >= 2 else 32
+    min_tile_size = 32 if q.element_size() == 1 else 16
+    if window_size[0] < 0:
+        # No sliding window: use full block tiles to minimize per-tile overhead
+        TILE_SIZE_PREFILL = max(min_tile_size, block_size)
+        TILE_SIZE_DECODE = TILE_SIZE_PREFILL
+    else:
+        TILE_SIZE_PREFILL = max(min_tile_size, 32)
+        TILE_SIZE_DECODE = max(min_tile_size, 16 if q.element_size() >= 2 else 32)
 
     # if batch contains a prefill
     if max_seqlen_q > 1 or total_num_q_blocks * num_kv_heads > 128:
