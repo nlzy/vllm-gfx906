@@ -137,6 +137,9 @@ class ModelConfig:
     """Allowing API requests to read local images or videos from directories
     specified by the server file system. This is a security risk. Should only
     be enabled in trusted environments."""
+    allowed_media_domains: Optional[list[str]] = None
+    """If set, only media URLs that belong to this domain can be used for 
+    multi-modal inputs. """
     revision: Optional[str] = None
     """The specific model version to use. It can be a branch name, a tag name,
     or a commit id. If unspecified, will use the default version."""
@@ -1074,14 +1077,14 @@ class ModelConfig:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
         elif self.hf_text_config.model_type in \
-            ('deepseek_v2', 'deepseek_v3', 'deepseek_mtp',
+            ('deepseek_v2', 'deepseek_v3', 'deepseek_v32', 'deepseek_mtp',
               'kimi_k2', 'longcat_flash'):
             return self.hf_text_config.kv_lora_rank is not None
         elif self.hf_text_config.model_type == 'eagle':
             # if the model is an EAGLE module, check for the
             # underlying architecture
             return self.hf_text_config.model.model_type in \
-                    ('deepseek_v2', 'deepseek_v3') \
+                    ('deepseek_v2', 'deepseek_v3', 'deepseek_v32') \
                 and self.hf_text_config.kv_lora_rank is not None
         return False
 
