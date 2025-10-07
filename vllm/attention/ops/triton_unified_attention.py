@@ -778,6 +778,7 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+    head_size_padded = triton.next_power_of_2(head_size)
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -798,14 +799,76 @@ def unified_attention(
     # Assigning default tile sizes for prefill and decode.
     # Note: each tile size must be at least 32 for "fp8" (q.element_size() == 1)
     # and at least 16 for all other data types.
-    min_tile_size = 32 if q.element_size() == 1 else 16
-    if window_size[0] < 0:
-        # No sliding window: use full block tiles to minimize per-tile overhead
-        TILE_SIZE_PREFILL = max(min_tile_size, block_size)
-        TILE_SIZE_DECODE = TILE_SIZE_PREFILL
-    else:
-        TILE_SIZE_PREFILL = max(min_tile_size, 32)
-        TILE_SIZE_DECODE = max(min_tile_size, 16 if q.element_size() >= 2 else 32)
+    is_fp8 = q.element_size() == 1
+    min_tile_size = 32 if is_fp8 else 16
+    abs_min_tile_size = 32 if is_fp8 else 8
+
+    def _next_power_of_two(x: int) -> int:
+        if x <= 1:
+            return 1
+        return 1 << (x - 1).bit_length()
+
+    def _prev_power_of_two(x: int) -> int:
+        if x <= 1:
+            return 1
+        return 1 << ((x.bit_length() - 1))
+
+    preferred_prefill = min(_next_power_of_two(block_size), 256)
+    preferred_prefill = max(preferred_prefill, min_tile_size)
+    preferred_decode = max(min_tile_size,
+                           16 if q.element_size() >= 2 else 32)
+    preferred_decode = min(preferred_decode, preferred_prefill)
+
+    max_tile_shared = None
+    shared_mem_limit = None
+    try:
+        device_props = torch.cuda.get_device_properties(q.device)
+        shared_mem_limit = max(
+            getattr(device_props, "sharedMemPerBlockOptin", 0),
+            getattr(device_props, "sharedMemPerBlock", 0),
+        )
+        if shared_mem_limit == 0:
+            # Fallback to the architectural minimum when runtime does not report.
+            shared_mem_limit = 64 * 1024
+        if shared_mem_limit and shared_mem_limit > 0:
+            head_bytes = max(2 * head_size_padded *
+                             max(k.element_size(), v.element_size(), 1), 1)
+            softmax_bytes = max(BLOCK_M * 4, 1)
+            max_tile_per_head = shared_mem_limit // head_bytes
+            max_tile_softmax = shared_mem_limit // softmax_bytes
+            if max_tile_per_head > 0:
+                candidates = [max_tile_per_head]
+                if max_tile_softmax > 0:
+                    candidates.append(max_tile_softmax)
+                max_tile_shared = max(abs_min_tile_size, min(candidates))
+    except Exception:  # pragma: no cover
+        max_tile_shared = None
+
+    max_tile_block = min(_next_power_of_two(block_size), 256)
+    kv_elem_bytes = max(k.element_size(), v.element_size(), 1)
+
+    def _estimate_shared(tile: int) -> int:
+        if shared_mem_limit is None or shared_mem_limit <= 0:
+            return 0
+        shared = 0
+        shared += 2 * head_size_padded * tile * kv_elem_bytes
+        shared += 2 * BLOCK_M * tile * 4
+        return shared
+
+    def _final_tile(preferred: int) -> int:
+        tile = max(preferred, min_tile_size)
+        tile = _next_power_of_two(tile)
+        tile = min(tile, max_tile_block)
+        if max_tile_shared is not None and max_tile_shared > 0:
+            while tile > max_tile_shared and tile > abs_min_tile_size:
+                tile //= 2
+        if shared_mem_limit and shared_mem_limit > 0:
+            while tile > abs_min_tile_size and _estimate_shared(tile) > shared_mem_limit:
+                tile //= 2
+        return max(tile, abs_min_tile_size)
+
+    TILE_SIZE_PREFILL = _final_tile(preferred_prefill)
+    TILE_SIZE_DECODE = _final_tile(preferred_decode)
 
     # if batch contains a prefill
     if max_seqlen_q > 1 or total_num_q_blocks * num_kv_heads > 128:
