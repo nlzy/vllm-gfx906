@@ -8,7 +8,7 @@ numba == 0.61.2; python_version > '3.9'
 boto3
 botocore
 datasets
-ray[cgraph]>=2.48.0 # Ray Compiled Graph, required for pipeline parallelism in V1.
+ray[cgraph]>=2.50.0 # Ray Compiled Graph, required for pipeline parallelism in V1. work new support mi50
 peft
 pytest-asyncio
 tensorizer==2.10.1
