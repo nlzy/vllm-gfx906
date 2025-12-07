@@ -94,13 +94,15 @@ class GPTQConfig(QuantizationConfig):
                 "Currently, only 2/3/4/8-bit weight quantization is "
                 f"supported for GPTQ, but got {self.weight_bits} bits."
             )
+
+        # gfx906: this issue was fixed in vllm-gfx906
         # Somehow gptq_gemm 4-bit is buggy, maybe fix it in the future.
         # For now, show a warning, since gptq_marlin will be used by default.
-        if self.weight_bits == 4:
-            logger.warning_once(
-                "Currently, the 4-bit gptq_gemm kernel for GPTQ is buggy. "
-                "Please switch to gptq_marlin or gptq_bitblas."
-            )
+        # if self.weight_bits == 4:
+        #     logger.warning_once(
+        #         "Currently, the 4-bit gptq_gemm kernel for GPTQ is buggy. "
+        #         "Please switch to gptq_marlin or gptq_bitblas."
+        #     )
 
         self.modules_in_block_to_quantize = modules_in_block_to_quantize or []
 
