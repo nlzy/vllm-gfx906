@@ -166,8 +166,11 @@ BUILD
 Please install ROCm 6.3 first. You need to install both kernel-mode driver and
 ROCm packages. Refer to the official documentation by AMD.
 
-You MUST INSTALL triton-gfx906 v3.4.0+gfx906 first, see:
-https://github.com/nlzy/triton-gfx906/tree/v3.4.0+gfx906
+You also need python-venv / python-dev, on Debian / Ubuntu use this command:
+$ sudo apt install python3-venv python3-dev
+
+You also need triton-gfx906 v3.5.0+gfx906 see:
+https://github.com/nlzy/triton-gfx906/tree/v3.5.0+gfx906
 
 ```
 cd vllm-gfx906
@@ -175,11 +178,10 @@ cd vllm-gfx906
 python3 -m venv vllmenv
 source vllmenv/bin/activate
 
-pip3 install 'torch==2.8' torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
-pip3 install -r requirements/rocm-build.txt
-pip3 install -r requirements/rocm.txt
+pip3 install 'torch==2.9' torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
+pip3 install -r requirements/rocm-build.txt -r requirements/rocm.txt
 
-pip3 install --no-build-isolation .
+pip3 install --no-build-isolation -v .
 ```
 
 
