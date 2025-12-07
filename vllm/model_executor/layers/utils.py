@@ -216,6 +216,28 @@ def default_unquantized_gemm(
     return torch.nn.functional.linear(x, weight, bias)
 
 
+def use_aiter_triton_gemm(n, m, k, dtype):
+    if (
+        envs.VLLM_ROCM_USE_AITER == 0
+        or envs.VLLM_ROCM_USE_AITER_TRITON_GEMM == 0
+        # MI300's - fp8nuz=True
+        or current_platform.is_fp8_fnuz()
+        or dtype not in [torch.float16, torch.bfloat16]
+    ):
+        return False
+
+    # use hipblaslt for the larger GEMMs
+    if n > 2048 and m > 512:
+        return False
+    return (
+        (m == 5120 and k == 2880)
+        or (m == 2880 and k == 4096)
+        or (m == 128 and k == 2880)
+        or (m == 640 and k == 2880)
+        or (m == 2880 and k == 512)
+    )
+
+
 def rocm_unquantized_gemm_impl(
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -243,7 +265,7 @@ def rocm_unquantized_gemm_impl(
     return torch.nn.functional.linear(x, weight, bias)
 
 
-def rocm_unquantized_gemm_impl_fake(
+def rocm_unquantized_gemm_fake(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
@@ -255,13 +277,13 @@ def rocm_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return torch.ops.vllm.rocm_unquantized_gemm_impl(x, weight, bias)
+    return torch.ops.vllm.rocm_unquantized_gemm(x, weight, bias)
 
 
 direct_register_custom_op(
-    op_name="rocm_unquantized_gemm_impl",
+    op_name="rocm_unquantized_gemm",
     op_func=rocm_unquantized_gemm_impl,
-    fake_impl=rocm_unquantized_gemm_impl_fake,
+    fake_impl=rocm_unquantized_gemm_fake,
 )
 
 
