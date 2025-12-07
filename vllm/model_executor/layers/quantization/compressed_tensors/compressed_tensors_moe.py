@@ -139,11 +139,27 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         )
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-            if (weight_quant.strategy in QuantizationStrategy.GROUP and
-                    weight_quant.actorder in (ActivationOrdering.GROUP,
-                                                ActivationOrdering.DYNAMIC)):
-                raise ValueError(
-                    "WNA16MoE is not supported with actorder=group/dynamic."
+            # group_size=None means channelwise
+            group_size = weight_quant.group_size or -1
+            # Prefer to use the MarlinMoE kernel when it is supported.
+            if (
+                not check_moe_marlin_supports_layer(layer, group_size)
+                or current_platform.is_rocm()
+            ):
+                if (
+                    weight_quant.strategy == QuantizationStrategy.GROUP
+                    and weight_quant.actorder
+                    in (ActivationOrdering.GROUP, ActivationOrdering.DYNAMIC)
+                ):
+                    raise ValueError(
+                        "WNA16MoE is not supported with actorder=group/dynamic."
+                    )
+                logger.info_once("Using CompressedTensorsWNA16MoEMethod")
+                return CompressedTensorsWNA16MoEMethod(quant_config, layer.moe_config)
+            else:
+                logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
+                return CompressedTensorsWNA16MarlinMoEMethod(
+                    quant_config, layer.moe_config
                 )
             logger.info_once("Using CompressedTensorsWNA16MoEMethod")
             return CompressedTensorsWNA16MoEMethod(quant_config, layer.moe_config)
@@ -293,10 +309,12 @@ class CompressedTensorsW4A4MoeMethod(CompressedTensorsMoEMethod):
         layer.w13_weight = torch.nn.Parameter(
             layer.w13_weight_packed.data, requires_grad=False
         )
+        delattr(layer, "w13_weight_packed")
 
         layer.w2_weight = torch.nn.Parameter(
             layer.w2_weight_packed.data, requires_grad=False
         )
+        delattr(layer, "w2_weight_packed")
 
         # reorder GEMM1 weights and block scales for FlashInfer CUTLASS kernel.
         if self.allow_flashinfer:
@@ -837,7 +855,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         # Property to determine if AITER is used
         if self.rocm_aiter_moe_enabled:
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (  # noqa E501
-                rocm_aiter_fused_experts,
                 shuffle_weights,
             )
 
@@ -1045,6 +1062,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             indices_type=self.topk_indices_dtype,
+            num_fused_shared_experts=layer.num_fused_shared_experts,
         )
 
         per_act_token = self.input_quant.strategy == QuantizationStrategy.TOKEN

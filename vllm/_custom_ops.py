@@ -339,18 +339,6 @@ def fused_add_rms_norm(
     torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
 
 
-def poly_norm(
-    out: torch.Tensor,
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    epsilon: float,
-) -> None:
-    # TODO: Remove this contiguous call when the kernel is updated to support non-contiguous input
-    input_contiguous = input.contiguous()
-    torch.ops._C.poly_norm(out, input_contiguous, weight, bias, epsilon)
-
-
 def apply_repetition_penalties_torch(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,
@@ -1499,7 +1487,7 @@ def scaled_fp8_quant(
                 output, input, scale, scale_ub
             )
         else:
-            scale = torch.empty(1, device=input.device, dtype=torch.float32)
+            scale = torch.empty((1, 1), device=input.device, dtype=torch.float32)
             torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
     else:
         assert scale.numel() == 1, f"{scale.shape}"
@@ -1781,23 +1769,86 @@ def moe_align_block_size(
     )
 
 
-def moe_wna16_gemm(input: torch.Tensor, output: torch.Tensor,
-                   b_qweight: torch.Tensor, b_scales: torch.Tensor,
-                   b_qzeros: torch.Tensor | None,
-                   topk_weights: torch.Tensor | None,
-                   sorted_token_ids: torch.Tensor, experts_ids: torch.Tensor,
-                   num_tokens_post_pad: torch.Tensor, top_k: int,
-                   BLOCK_SIZE_M: int, BLOCK_SIZE_N: int, BLOCK_SIZE_K: int,
-                   bit: int) -> torch.Tensor:
+def batched_moe_align_block_size(
+    max_tokens_per_batch: int,
+    block_size: int,
+    expert_num_tokens: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    torch.ops._moe_C.batched_moe_align_block_size(
+        max_tokens_per_batch,
+        block_size,
+        expert_num_tokens,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+    )
+
+
+def moe_lora_align_block_size(
+    topk_ids: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    max_loras: int,
+    max_num_tokens_padded: int,
+    max_num_m_blocks: int,
+    sorted_token_ids: torch.Tensor,
+    experts_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    torch.ops._moe_C.moe_lora_align_block_size(
+        topk_ids,
+        token_lora_mapping,
+        num_experts,
+        block_size,
+        max_loras,
+        max_num_tokens_padded,
+        max_num_m_blocks,
+        sorted_token_ids,
+        experts_ids,
+        num_tokens_post_pad,
+    )
+
+
+def moe_wna16_gemm(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    b_qweight: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_qzeros: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    experts_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    top_k: int,
+    BLOCK_SIZE_M: int,
+    BLOCK_SIZE_N: int,
+    BLOCK_SIZE_K: int,
+    bit: int,
+) -> torch.Tensor:
     if not current_platform.is_cuda_alike():
         raise NotImplementedError(
-            "The un-optimized moe_wna16_gemm kernel is only "
-            "available on CUDA or ROCm platforms")
-    torch.ops._moe_C.moe_wna16_gemm(input, output, b_qweight, b_scales,
-                                    b_qzeros, topk_weights, sorted_token_ids,
-                                    experts_ids, num_tokens_post_pad, top_k,
-                                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
-                                    bit)
+            "The optimized moe_wna16_gemm kernel is only available on CUDA or ROCm platforms"
+        )
+    torch.ops._moe_C.moe_wna16_gemm(
+        input,
+        output,
+        b_qweight,
+        b_scales,
+        b_qzeros,
+        topk_weights,
+        sorted_token_ids,
+        experts_ids,
+        num_tokens_post_pad,
+        top_k,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
+        bit,
+    )
 
 
 def topk_softmax(
@@ -1805,9 +1856,10 @@ def topk_softmax(
     topk_ids: torch.Tensor,
     token_expert_indices: torch.Tensor,
     gating_output: torch.Tensor,
+    renormalize: bool = False,
 ) -> None:
     torch.ops._moe_C.topk_softmax(
-        topk_weights, topk_ids, token_expert_indices, gating_output
+        topk_weights, topk_ids, token_expert_indices, gating_output, renormalize
     )
 
 
