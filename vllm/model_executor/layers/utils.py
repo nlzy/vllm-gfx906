@@ -225,7 +225,7 @@ def rocm_unquantized_gemm_impl(
     if use_skinny is not True:
         return torch.nn.functional.linear(x, weight, bias)
 
-    x_view = x.view(-1, x.size(-1))
+    x_view = x.reshape(-1, x.size(-1))
     n = x_view.shape[0]
     m = weight.shape[0]
     k = weight.shape[1]
