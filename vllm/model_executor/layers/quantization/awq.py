@@ -257,7 +257,7 @@ class AWQLinearMethod(LinearMethodBase):
         output = ops.gptq_gemm(
             reshaped_x, layer.qweight, layer.qzeros, layer.scales,
             torch.empty(0, device=layer.qweight.device),
-            True, False, self.quant_config.weight_bits
+            True, True, self.quant_config.weight_bits
         )
         if bias is not None:
             output.add_(bias)

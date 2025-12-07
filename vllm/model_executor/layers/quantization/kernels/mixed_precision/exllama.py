@@ -77,7 +77,7 @@ class ExllamaLinearKernel(MPLinearKernel):
             assert c.weight_type.has_bias()
             groups = c.partition_weight_shape[0] // c.group_size
             out_features = c.partition_weight_shape[1]
-            # exllama kernel in nlzy/vllm-gfx906 allow to passing bias_one=False,
+            # gfx906: We will pass use_v2_format=True to gptq_gemm,
             # no need to subtract 1 here
             zeros = torch.full((groups, out_features),
                                 c.weight_type.bias,
@@ -136,10 +136,14 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         w_q, w_s, w_zp, w_g_idx = self._get_weight_params(layer)
 
+        # gfx906: see comment above
+        use_v2_format = True
+
         assert w_zp is not None, "Zero points are required by Exllama"
         assert w_g_idx is not None, "Group index is required by Exllama"
-        output = ops.gptq_gemm(x_2d, w_q, w_zp, w_s, w_g_idx, True, False,
-                               c.weight_type.size_bits)
+
+        output = ops.gptq_gemm(x_2d, w_q, w_zp, w_s, w_g_idx, True,
+                               use_v2_format, c.weight_type.size_bits)
 
         if bias is not None:
             output.add_(bias)

@@ -444,25 +444,44 @@ def awq_gemm(
 
 
 # gptq
-def gptq_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,
-              b_gptq_qzeros: torch.Tensor, b_gptq_scales: torch.Tensor,
-              b_g_idx: torch.Tensor, use_exllama: bool, bias_one: bool,
-              bit: int) -> torch.Tensor:
-    return torch.ops._C.gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales,
-                                  b_g_idx, use_exllama, bias_one, bit)
+def gptq_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_gptq_qzeros: torch.Tensor,
+    b_gptq_scales: torch.Tensor,
+    b_g_idx: torch.Tensor,
+    use_exllama: bool,
+    use_v2_format: bool,
+    bit: int,
+) -> torch.Tensor:
+    return torch.ops._C.gptq_gemm(
+        a,
+        b_q_weight,
+        b_gptq_qzeros,
+        b_gptq_scales,
+        b_g_idx,
+        use_exllama,
+        use_v2_format,
+        bit,
+    )
 
 
 if hasattr(torch.ops._C, "gptq_gemm"):
 
     @register_fake("_C::gptq_gemm")
-    def _gptq_gemm_fake(a: torch.Tensor, b_q_weight: torch.Tensor,
-                        b_gptq_qzeros: torch.Tensor,
-                        b_gptq_scales: torch.Tensor, b_g_idx: torch.Tensor,
-                        use_exllama: bool, bias_one: bool,
-                        bit: int) -> torch.Tensor:
-        return torch.empty((a.size(0), b_q_weight.size(1)),
-                           dtype=a.dtype,
-                           device=a.device)
+    def _gptq_gemm_fake(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_gptq_qzeros: torch.Tensor,
+        b_gptq_scales: torch.Tensor,
+        b_g_idx: torch.Tensor,
+        use_exllama: bool,
+        use_v2_format: bool,
+        bit: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (a.size(0), b_q_weight.size(1)), dtype=a.dtype, device=a.device
+        )
 
 
 def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
