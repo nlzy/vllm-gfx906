@@ -438,10 +438,8 @@ class VllmConfig:
         # we use the default mode. The default mode depends on other
         # settings (see the below code).
         if self.compilation_config.mode is None:
-            if self.model_config is not None and not self.model_config.enforce_eager:
-                self.compilation_config.mode = CompilationMode.VLLM_COMPILE
-            else:
-                self.compilation_config.mode = CompilationMode.NONE
+            logger.info("[vllm-gfx906] Set compilation_config default to NONE")
+            self.compilation_config.mode = CompilationMode.NONE
 
         # If user does not set custom ops via none or all set it here based on
         # compilation mode and backend.
@@ -463,13 +461,8 @@ class VllmConfig:
             # if cudagraph_mode is not explicitly set by users, set default
             # value
             if self.compilation_config.cudagraph_mode is None:
-                if self.compilation_config.mode == CompilationMode.VLLM_COMPILE:
-                    # default to full and piecewise for most models
-                    self.compilation_config.cudagraph_mode = (
-                        CUDAGraphMode.FULL_AND_PIECEWISE
-                    )
-                else:
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                logger.info("[vllm-gfx906] Set cudagraph_mode default to FULL_DECODE_ONLY")
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
             # if cudagraph_mode has full cudagraphs, we need to check support
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -848,8 +841,10 @@ class VllmConfig:
                 self.compilation_config.max_cudagraph_capture_size
             )
             if max_cudagraph_capture_size is None:
+                logger.info(
+                    "[vllm-gfx906] Set max_cudagraph_capture_size default to 64")
                 max_cudagraph_capture_size = min(
-                    self.scheduler_config.max_num_seqs * 2, 512
+                    self.scheduler_config.max_num_seqs * 2, 64
                 )
             max_num_tokens = self.scheduler_config.max_num_batched_tokens
             max_cudagraph_capture_size = min(max_num_tokens, max_cudagraph_capture_size)
