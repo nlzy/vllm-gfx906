@@ -40,6 +40,11 @@ are slightly slow. Not recommended to use.
 NEWS
 -------------------
 
+2025-12-08:
+
+Update vLLM v0.11.2 / torch 2.9.0 / triton 3.5.0
+
+
 2025-09-12:
 
 Minor optimize in triton_unified_attention, reduce VRAM usage of AWQ
@@ -178,10 +183,10 @@ cd vllm-gfx906
 python3 -m venv vllmenv
 source vllmenv/bin/activate
 
-pip3 install 'torch==2.9' torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
+pip3 install torch==2.9 torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
 pip3 install -r requirements/rocm-build.txt -r requirements/rocm.txt
 
-pip3 install --no-build-isolation -v .
+pip3 install --no-build-isolation --no-deps -v .
 ```
 
 
