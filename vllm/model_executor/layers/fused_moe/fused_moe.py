@@ -912,10 +912,18 @@ def get_moe_wna16_block_config(
     if not use_moe_wna16_cuda:
         # triton moe wna16 kernel
         if num_valid_tokens // real_top_k == 1:
-            # if bs=1, use a smaller BLOCK_SIZE_N
-            return {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64}
+            block_size_n = 32
+            block_size_k = 64
         else:
-            return {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32}
+            block_size_n = 64
+            block_size_k = 32
+        while block_size_k > 16 and size_k % block_size_k != 0:
+            block_size_k //= 2
+        if size_k % block_size_k != 0:
+            block_size_k = 1 << (size_k.bit_length() - 1)
+            while block_size_k > size_k or size_k % block_size_k != 0:
+                block_size_k //= 2
+        return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
     else:
         # cuda moe wna16 kernel
         # set default block_size 128, and increase them when num_blocks
@@ -959,6 +967,13 @@ def get_moe_wna16_block_config(
             # Not sure why, maybe it force the CUDA SM process only one block
             # at the same time.
             block_size_n = 1024
+
+        while block_size_k > group_size and size_k % block_size_k != 0:
+            block_size_k //= 2
+        if size_k % block_size_k != 0:
+            block_size_k = 1 << (size_k.bit_length() - 1)
+            while block_size_k > group_size and size_k % block_size_k != 0:
+                block_size_k //= 2
 
         return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
 
