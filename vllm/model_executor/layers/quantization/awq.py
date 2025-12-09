@@ -116,6 +116,7 @@ class AWQConfig(QuantizationConfig):
                 "group_size": self.group_size,
                 "zero_point": self.zero_point,
                 "lm_head": False,
+                "modules_to_not_convert": self.modules_to_not_convert,
             }
             logger.warning_once(
                 "[vllm-gfx906] You are using modified MoeWNA16 kernel, "
