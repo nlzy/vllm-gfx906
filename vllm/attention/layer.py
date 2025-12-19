@@ -47,7 +47,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 if current_platform.is_rocm():
-    from vllm.platforms.rocm import on_gfx9
+    from vllm.platforms.rocm import on_gfx9, on_gfx906
 else:
     on_gfx9 = lambda *args, **kwargs: False
 
@@ -65,7 +65,7 @@ def maybe_get_vit_flash_attn_backend(
             attn_backend = AttentionBackendEnum.ROCM_AITER_FA
         elif (
             attn_backend_override is None
-            and on_gfx9()
+            and (on_gfx9() or on_gfx906())
             and attn_backend == AttentionBackendEnum.FLASH_ATTN
         ):
             pass

@@ -104,6 +104,10 @@ def on_gfx9() -> bool:
     GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
     return any(arch in GPU_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
 
+@cache
+def on_gfx906() -> bool:
+    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    return any(arch in GPU_ARCH for arch in ["gfx906"])
 
 @cache
 def on_gfx950() -> bool:
@@ -210,7 +214,7 @@ class RocmPlatform(Platform):
             # TODO: Add support for other VL models in their model class.
             return AttentionBackendEnum.ROCM_AITER_FA
 
-        if on_gfx9() and find_spec("flash_attn") is not None:
+        if (on_gfx9() or on_gfx906()) and find_spec("flash_attn") is not None:
             return AttentionBackendEnum.FLASH_ATTN
 
         return AttentionBackendEnum.TORCH_SDPA
