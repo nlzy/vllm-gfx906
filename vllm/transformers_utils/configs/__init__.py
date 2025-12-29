@@ -24,6 +24,7 @@ from vllm.transformers_utils.configs.kimi_vl import KimiVLConfig
 from vllm.transformers_utils.configs.lfm2_moe import Lfm2MoeConfig
 from vllm.transformers_utils.configs.medusa import MedusaConfig
 from vllm.transformers_utils.configs.midashenglm import MiDashengLMConfig
+from vllm.transformers_utils.configs.minimax_m2 import MiniMaxM2Config
 from vllm.transformers_utils.configs.mlp_speculator import MLPSpeculatorConfig
 from vllm.transformers_utils.configs.moonvit import MoonViTConfig
 from vllm.transformers_utils.configs.nemotron import NemotronConfig
@@ -52,6 +53,7 @@ __all__ = [
     "Lfm2MoeConfig",
     "MedusaConfig",
     "MiDashengLMConfig",
+    "MiniMaxM2Config",
     "MLPSpeculatorConfig",
     "MoonViTConfig",
     "KimiLinearConfig",
