@@ -18,7 +18,7 @@ elif current_platform.is_xpu():
     reshape_and_cache_flash = ops.reshape_and_cache_flash
     flash_attn_varlen_func = ops.flash_attn_varlen_func
     get_scheduler_metadata = ops.get_scheduler_metadata
-elif current_platform.is_rocm():
+elif current_platform.is_rocm() and not envs.VLLM_ROCM_USE_LEGACY_TRITON_FA:
     try:
         from flash_attn import flash_attn_varlen_func  # noqa: F401
     except ImportError as e:

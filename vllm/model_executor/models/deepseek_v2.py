@@ -28,6 +28,7 @@ import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
 
+import vllm.envs as envs
 import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -1033,7 +1034,8 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.is_v32 = hasattr(config, "index_topk")
+        # MLA Sparse (with Indexer) introduced by DS v3.2 can be enabled or not (EXPERIMENTAL)
+        self.is_v32 = False if envs.VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL else hasattr(config, "index_topk")
 
         if self.is_v32:
             self.indexer_rope_emb = get_rope(
@@ -1679,7 +1681,14 @@ class DeepseekV2ForCausalLM(
 
                         if is_pp_missing_parameter(name, self):
                             continue
-
+                        # ========================================================
+                        # Ignore Indexer Weights of MLA Sparse if VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL 
+                        # (it might disable MTP as well which depends on indexer)
+                        # ========================================================
+                        if envs.VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL and name not in params_dict:
+                            if "indexer" in name:
+                                continue
+                        # ========================================================
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader

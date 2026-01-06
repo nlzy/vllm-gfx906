@@ -29,6 +29,7 @@ Memory-efficient attention for decoding.
 It supports page size >= 1.
 """
 
+import functools
 import logging
 
 from packaging import version
@@ -39,6 +40,11 @@ from vllm.triton_utils import tl, triton
 is_hip_ = current_platform.is_rocm()
 
 logger = logging.getLogger(__name__)
+
+@functools.cache
+def is_rocm_gfx906():
+    return current_platform.is_rocm() and triton.runtime.driver.active.get_current_target().arch in ["gfx906"] 
+
 
 # Only print the following warnings when triton version < 3.2.0.
 # The issue won't affect performance or accuracy.
@@ -239,7 +245,7 @@ def _decode_att_m_fwd(
         PAGE_SIZE=page_size,
         logit_cap=logit_cap,
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=2 if not is_rocm_gfx906 else 1,
         Lk=Lk,
         Lv=Lv,
     )
@@ -452,10 +458,12 @@ def _decode_grouped_att_m_fwd(
 
     extra_kargs = {}
     num_stages = 2
-    if is_hip_:
+    if is_hip_ and not is_rocm_gfx906:
         # https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html#mi300x-triton-kernel-performance-optimization
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        num_stages = 1
+    if is_rocm_gfx906:
         num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
@@ -573,7 +581,7 @@ def _decode_softmax_reducev_fwd(
     NUM_KV_SPLITS = num_kv_splits
 
     extra_kargs = {}
-    if is_hip_:
+    if is_hip_ and not is_rocm_gfx906:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
@@ -594,7 +602,7 @@ def _decode_softmax_reducev_fwd(
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         num_warps=4,
-        num_stages=2,
+        num_stages=2 if not is_rocm_gfx906 else 1,
         **extra_kargs,
     )
 

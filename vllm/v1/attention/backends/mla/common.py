@@ -256,8 +256,10 @@ try:
     is_vllm_fa = True
 except ImportError:
     # For rocm use upstream flash attention
-    if current_platform.is_rocm():
+    if current_platform.is_rocm() and not envs.VLLM_ROCM_USE_LEGACY_TRITON_FA:
         from flash_attn import flash_attn_varlen_func
+    if envs.VLLM_ROCM_USE_LEGACY_TRITON_FA:
+        from vllm.attention.ops.triton_flash_attention import triton_attention as flash_attn_varlen_func
     is_vllm_fa = False
 
 try:
@@ -1341,13 +1343,30 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         if vllm_is_batch_invariant():
             kwargs["num_splits"] = 1
 
-        attn_out = self.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=maybe_padded_v,
-            softmax_scale=softmax_scale,
-            **kwargs,
-        )
+        if envs.VLLM_ROCM_USE_LEGACY_TRITON_FA:
+            # The output of triton_attention is a tuple of
+            # [output_tensor, encoded_softmax] where encoded_softmax is always None
+            attn_out, _ = self.flash_attn_varlen_func(
+                q,
+                k,
+                maybe_padded_v,
+                None,  # output
+                kwargs["cu_seqlens_q"],
+                kwargs["cu_seqlens_k"],
+                kwargs["max_seqlen_q"],
+                kwargs["max_seqlen_k"],
+                kwargs["causal"],
+                softmax_scale,
+                None,  # bias
+            )
+        else:
+            attn_out = self.flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=maybe_padded_v,
+                softmax_scale=softmax_scale,
+                **kwargs,
+            )
 
         # Unpack the output if there is multiple results
         lse = None
@@ -1357,8 +1376,16 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         # Remain consistent with old `flash_attn_varlen_func` where there
         # is only one output tensor if `return_softmax_lse` is False.
         if return_softmax_lse:
-            return attn_out, lse
-        return attn_out
+            # LSE from triton kernel does not work, producing garbage outputs (see PR-14316 https://github.com/vllm-project/vllm/pull/14316).
+            # And the PR-14316 which introduces fallback to flash-attn does not work for gfx906
+            # as flash-attn with CK (composable kernel) backend is not working with gfx906 (even if the build is OK) for now. 
+            # And flash-attn with triton backend does not work neither as said previously. 
+            # TODO: MLA implementation needs to be fixed and updated when there's a working LSE for gfx906
+            # In the meantime, --no-enable-prefix-caching and --no-enable-chunked-prefill are mandatory when using gfx906 to run MLA (without sparse)
+            # These settings will always set has_context to false and so avoid running the computation of prefill context and the merge_attn_states (where LSE is required)
+            return attn_out, lse # LSE shape expected by triton_merge_attn_states is: [NUM_HEADS, NUM_TOKENS]
+        
+        return attn_out  
 
     def _run_prefill_new_tokens_fa(
         self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
