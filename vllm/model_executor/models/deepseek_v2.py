@@ -601,11 +601,50 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         return DeepseekV32IndexerBackend
 
 
+def gather_k_from_cache(kv_cache, block_table, cu_seq_lens, head_dim):
+    """
+    Non Optimized vibe coded python gather (avoids torch.cat overhead by pre-allocating the result).
+    """
+    # 1. Pre-allocate the full output tensor at once
+    # We know the total size is the last cumulative sequence length
+    total_tokens = cu_seq_lens[-1].item()
+    k_out = torch.empty((total_tokens, head_dim), dtype=kv_cache.dtype, device=kv_cache.device)
+    
+    batch_size = block_table.shape[0]
+    block_size = kv_cache.shape[1]
+    
+    # 2. Iterate and fill (In-place copy)
+    for i in range(batch_size):
+        # Indices for the destination tensor
+        start_idx = cu_seq_lens[i].item()
+        end_idx = cu_seq_lens[i+1].item()
+        seq_len = end_idx - start_idx
+        
+        if seq_len == 0:
+            continue
+            
+        # Indices for the source cache
+        num_blocks = (seq_len + block_size - 1) // block_size
+        block_ids = block_table[i, :num_blocks].to(torch.long)
+        
+        # Gather blocks: [Num_Blocks, Block_Size, Head_Dim]
+        # Using advanced indexing here invokes a fast C++ kernel in PyTorch background
+        blocks = kv_cache[block_ids]
+        
+        # Reshape to linear and trim padding
+        # .view() is zero-copy, so this is fast
+        valid_k = blocks.view(-1, head_dim)[:seq_len]
+        
+        # Copy into the pre-allocated buffer
+        k_out[start_idx:end_idx].copy_(valid_k)
+        
+    return k_out
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
     kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
+    q: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
@@ -625,7 +664,7 @@ def sparse_attn_indexer(
             hidden_states,
             k_cache_prefix,
             kv_cache,
-            q_fp8,
+            q,
             k,
             weights,
             quant_block_size,
@@ -642,45 +681,81 @@ def sparse_attn_indexer(
     has_decode = attn_metadata.num_decodes > 0
     has_prefill = attn_metadata.num_prefills > 0
     num_decode_tokens = attn_metadata.num_decode_tokens
+    
+    if not envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16:
+        ops.indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+        )
+    else:
+        # --------------------------------------------------------------------------
+        # STEP 1: Cache Population (Write)
+        # --------------------------------------------------------------------------
+        if slot_mapping is not None:
+            # kv_cache is already [Blocks, BlockSize, 128]
+            flat_cache = kv_cache.view(-1, head_dim)
+            
+            # --- FIX: Trust slot_mapping as the "Real" count ---
+            num_slots = slot_mapping.numel()
+            
+            # Slice k to remove the CUDA graph padding
+            k_valid = k[:num_slots]
+            
+            # Write valid data to valid slots
+            flat_cache.index_copy_(0, slot_mapping, k_valid)
 
-    ops.indexer_k_quant_and_cache(
-        k,
-        kv_cache,
-        slot_mapping,
-        quant_block_size,
-        scale_fmt,
-    )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata.prefill
         for chunk in prefill_metadata.chunks:
-            k_fp8 = torch.empty(
-                [chunk.total_seq_lens, head_dim],
-                device=k.device,
-                dtype=fp8_dtype,
-            )
-            k_scale = torch.empty(
-                [chunk.total_seq_lens, 4],
-                device=k.device,
-                dtype=torch.uint8,
-            )
-            ops.cp_gather_indexer_k_quant_cache(
-                kv_cache,
-                k_fp8,
-                k_scale,
-                chunk.block_table,
-                chunk.cu_seq_lens,
-            )
-            fp8_mqa_logits_func = fp8_mqa_logits
+            if not envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16:
+                k_fp = torch.empty(
+                    [chunk.total_seq_lens, head_dim],
+                    device=k.device,
+                    dtype=fp8_dtype,
+                )
+                k_scale = torch.empty(
+                    [chunk.total_seq_lens, 4],
+                    device=k.device,
+                    dtype=torch.uint8,
+                )
+                ops.cp_gather_indexer_k_quant_cache(
+                    kv_cache,
+                    k_fp,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                )
+            else:
+                # ------------------------------------------------------------------
+                # STEP 2: Key Retrieval (Read GLOBAL History + Current)
+                # ------------------------------------------------------------------
+                # FIX: We cannot use k[chunk.start:chunk.end] because 'k' only contains
+                # the *new* tokens in this forward pass. We need the full history
+                # (including previous chunks) which now resides in kv_cache.
+                
+                # Using the helper function to gather K from the cache we just wrote to
+                k_fp = gather_k_from_cache(
+                    kv_cache=kv_cache,
+                    block_table=chunk.block_table,
+                    cu_seq_lens=chunk.cu_seq_lens,
+                    head_dim=head_dim
+                )
+            
+            mqa_logits_func = fp8_mqa_logits
             if current_platform.is_rocm():
                 from vllm.attention.ops.rocm_aiter_mla_sparse import rocm_fp8_mqa_logits
-
-                fp8_mqa_logits_func = rocm_fp8_mqa_logits
-            logits = fp8_mqa_logits_func(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
+                from vllm.attention.ops.rocm_aiter_mla_sparse import fp16_mqa_logits_torch
+                mqa_logits_func = fp16_mqa_logits_torch if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16 else rocm_fp8_mqa_logits
+            
+            logits = mqa_logits_func(
+                q[chunk.token_start : chunk.token_end], # q is valid to slice (current only), fp16 or fp8
+                k_fp if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16 else (k_fp, k_scale.view(torch.float32)),   # k MUST be full history,  fp16 or fp8
+                weights[chunk.token_start : chunk.token_end], # fp32
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
             )
@@ -689,7 +764,7 @@ def sparse_attn_indexer(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            torch.ops._C.top_k_per_row(
+            torch.ops._C.top_k_per_row_prefill(
                 logits,
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
@@ -697,6 +772,7 @@ def sparse_attn_indexer(
                 num_rows,
                 logits.stride(0),
                 logits.stride(1),
+                topk_tokens,
             )
 
     if has_decode:
@@ -710,29 +786,32 @@ def sparse_attn_indexer(
             # decode_threshold since we unstrictly split
             # prefill and decode by decode_threshold
             # (currently set to 1 + speculative tokens)
-            padded_q_fp8_decode_tokens = pack_seq_triton(
-                q_fp8[:num_decode_tokens], decode_lens
+            padded_q_decode_tokens = pack_seq_triton(
+                q[:num_decode_tokens], decode_lens
             )
         else:
-            padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
-                decode_lens.shape[0], -1, *q_fp8.shape[1:]
+            padded_q_decode_tokens = q[:num_decode_tokens].reshape(
+                decode_lens.shape[0], -1, *q.shape[1:]
             )
         # TODO: move and optimize below logic with triton kernels
-        batch_size = padded_q_fp8_decode_tokens.shape[0]
-        next_n = padded_q_fp8_decode_tokens.shape[1]
+        batch_size = padded_q_decode_tokens.shape[0]
+        next_n = padded_q_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
-        fp8_paged_mqa_logits_func = fp8_paged_mqa_logits
+        
+        paged_mqa_logits_func = fp8_paged_mqa_logits
         if current_platform.is_rocm():
             from vllm.attention.ops.rocm_aiter_mla_sparse import (
                 rocm_fp8_paged_mqa_logits,
             )
+            from vllm.attention.ops.rocm_aiter_mla_sparse import fp16_paged_mqa_logits_torch
 
-            fp8_paged_mqa_logits_func = rocm_fp8_paged_mqa_logits
-        logits = fp8_paged_mqa_logits_func(
-            padded_q_fp8_decode_tokens,
-            kv_cache,
-            weights[:num_padded_tokens],
+
+            paged_mqa_logits_func = fp16_paged_mqa_logits_torch if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16 else rocm_fp8_paged_mqa_logits
+        logits = paged_mqa_logits_func(
+            padded_q_decode_tokens, # fp16 or fp8
+            kv_cache, # fp16 or fp8
+            weights[:num_padded_tokens], # fp32
             decode_metadata.seq_lens,
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
@@ -750,6 +829,7 @@ def sparse_attn_indexer(
             num_rows,
             logits.stride(0),
             logits.stride(1),
+            topk_tokens,
         )
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -769,7 +849,7 @@ def sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
     kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
+    q: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
@@ -783,12 +863,43 @@ def sparse_attn_indexer_fake(
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
     # profile_run can get correct memory usage.
-    _flattened_kv = torch.empty(
-        [total_seq_lens, head_dim + 4], device=k.device, dtype=torch.uint8
-    )
-    fp8_dtype = current_platform.fp8_dtype()
-    _k_fp8 = _flattened_kv[..., :head_dim].view(fp8_dtype).contiguous()
-    _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
+
+    if not envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16:
+        _flattened_kv = torch.empty(
+            [total_seq_lens, head_dim + 4], device=k.device, dtype=torch.uint8
+        )
+        fp8_dtype = current_platform.fp8_dtype()
+        _k_fp8 = _flattened_kv[..., :head_dim].view(fp8_dtype).contiguous()
+        _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
+    else:
+        _flattened_k = torch.empty(
+            [total_seq_lens, head_dim], device=k.device, dtype=torch.float16
+        )
+
+    if envs.VLLM_ATTENTION_BACKEND=="ROCM_AITER_MLA_SPARSE" and not envs.VLLM_ROCM_USE_AITER: 
+        # 1. Prefill Memory (Chunked)
+        # TODO: Make HEAD_CHUNK_SIZE as env variable if the non optimized vibe coded pytorch ops is still used in future build
+        # As HEAD_CHUNK_SIZE is also used in vllm/attention/ops/rocm_aiter_mla_sparse.py
+        HEAD_CHUNK_SIZE = 1
+        
+        # Calculate worst-case memory for one chunk
+        # TODO: To be fixed as that's not the real worst-case memory (tests with 16 MI50 shows +6% VRAM / GPU from gpu-memory-utilization value at peak)  
+        # Shape: [Chunk_Size, Q_Tokens, History_Len]
+        prefill_elements = HEAD_CHUNK_SIZE * q.shape[0] * total_seq_lens
+
+        # 2. Decode Memory
+        # Shape: [Batch_Size, Max_Model_Len]
+        # In decode, q.shape[0] is batch_size
+        decode_elements = q.shape[0] * max_model_len
+
+        # 3. Maximize
+        max_elements = max(prefill_elements, decode_elements)
+        _mimic_logits = torch.empty(
+            max_elements,
+            device=q.device, 
+            dtype=torch.float32 
+        )
+
     return topk_indices_buffer
 
 
@@ -839,7 +950,11 @@ class Indexer(nn.Module):
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = ReplicatedLinear(
-            hidden_size, self.n_head, quant_config=None, prefix=f"{prefix}.weights_proj"
+            hidden_size,
+            self.n_head,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
 
@@ -851,8 +966,8 @@ class Indexer(nn.Module):
         #       where we store value in fp8 and scale in fp32
         #       per self.quant_block_size element
         self.k_cache = DeepseekV32IndexerCache(
-            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
-            dtype=torch.uint8,
+            head_dim=self.head_dim if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16 else self.head_dim + self.head_dim // self.quant_block_size * 4,
+            dtype=torch.float16 if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16 else torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
         )
@@ -878,19 +993,26 @@ class Indexer(nn.Module):
         )
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        q = torch.cat([q_pe.squeeze(0), q_nope], dim=-1)
-        k = torch.cat([k_pe.squeeze((0, 2)), k_nope], dim=-1)
-
+        # Note: RoPE (NeoX) can introduce extra leading dimensions during compilation
+        # so we need to reshape back to token-flattened shapes
+        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
+        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
         # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = per_token_group_quant_fp8(
-            q,
-            self.quant_block_size,
-            column_major_scales=False,
-            use_ue8m0=self.scale_fmt is not None,
-        )
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
+        if not envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16:
+            q = q.view(-1, self.head_dim)
+            q, q_scale = per_token_group_quant_fp8(
+                q,
+                self.quant_block_size,
+                column_major_scales=False,
+                use_ue8m0=self.scale_fmt is not None,
+            )
+            q = q.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
+        else:
+            q_scale = 1
 
         weights, _ = self.weights_proj(hidden_states)
         weights = (
@@ -900,11 +1022,11 @@ class Indexer(nn.Module):
 
         return torch.ops.vllm.sparse_attn_indexer(
             hidden_states,
-            self.k_cache.prefix,
-            self.k_cache.kv_cache[0],
-            q_fp8,
-            k,
-            weights,
+            self.k_cache.prefix, # fp16 or fp8
+            self.k_cache.kv_cache[0], # fp16 or fp8
+            q, # fp16 or fp8
+            k, # fp16 or fp8
+            weights, # fp32
             self.quant_block_size,
             self.scale_fmt,
             self.topk_tokens,
@@ -1595,7 +1717,11 @@ class DeepseekV2ForCausalLM(
                     # Determine split axis based on op type
                     # gate/up: ColumnParallel → split along dim 0
                     # down: RowParallel → split along dim 1
-                    split_dim = 1 if "down_proj.weight" in name else 0
+                    split_dim = (
+                        1
+                        if ("down_proj.weight" in name and loaded_weight.ndim > 1)
+                        else 0
+                    )
                     total = loaded_weight.shape[split_dim]
                     assert total % num_chunks == 0, (
                         f"Shared expert weight dim {total} "
@@ -1608,14 +1734,13 @@ class DeepseekV2ForCausalLM(
                     weight_to_load = loaded_weight
 
                     if is_fusion_moe_shared_experts_layer:
-                        if split_dim == 0:
-                            weight_to_load = loaded_weight[
-                                j * chunk_size : (j + 1) * chunk_size, :
-                            ]
+                        chunk_slice = slice(j * chunk_size, (j + 1) * chunk_size)
+                        if loaded_weight.ndim == 1:
+                            weight_to_load = loaded_weight[chunk_slice]
+                        elif split_dim == 0:
+                            weight_to_load = loaded_weight[chunk_slice, :]
                         else:
-                            weight_to_load = loaded_weight[
-                                :, j * chunk_size : (j + 1) * chunk_size
-                            ]
+                            weight_to_load = loaded_weight[:, chunk_slice]
                         # Synthesize an expert-style name so expert mapping
                         # can route it
                         chunk_name = name.replace(

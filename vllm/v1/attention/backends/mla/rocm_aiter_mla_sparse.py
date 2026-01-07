@@ -66,7 +66,8 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_dtypes(cls) -> list[torch.dtype]:
-        return [torch.bfloat16]
+        # --- float16 added for gfx906 support ---
+        return [torch.float16, torch.bfloat16]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -226,7 +227,7 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
         self.topk_indices_buffer = indexer.topk_indices_buffer
         self.is_fp8bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
 
-    def _forward_bf16_kv(
+    def _forward_fp16_bf16_kv(
         self,
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
@@ -317,7 +318,7 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
                 scale=layer._k_scale,
             )
 
-        attn_out = self._forward_bf16_kv(
+        attn_out = self._forward_fp16_bf16_kv(
             q, kv_cache, topk_indices_global, attn_metadata
         )
 

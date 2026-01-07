@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL: bool = False
     VLLM_ROCM_USE_LEGACY_TRITON_FA: bool = False
+    VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16: bool = False
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
@@ -917,6 +918,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_USE_LEGACY_TRITON_FA": lambda: (
         os.environ.get("VLLM_ROCM_USE_LEGACY_TRITON_FA", "0").strip().lower()
+        in ("1", "true")
+    ),
+    "VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16": lambda: (
+        os.environ.get("VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16", "0").strip().lower()
         in ("1", "true")
     ),
     # We assume drivers can report p2p status correctly.

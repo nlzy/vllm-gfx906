@@ -56,6 +56,94 @@ def fp8_mqa_logits_torch(
 
     return logits
 
+# Take from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L84
+def fp16_mqa_logits_torch(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Compute MQA logits for a single sequence without KV paging.
+
+    Args:
+        q: Query tensor of shape [M, H, D]. fp16
+        kv: `kv` has shape [N, D] with dtype `torch.float16` 
+        weights: weights of shape [M, H], dtype `torch.float32`.
+        cu_seqlen_ks: Start indices (inclusive) for valid K per query position,
+            shape [M], dtype int32.
+        cu_seqlen_ke: End indices (exclusive) for valid K per query position,
+            shape [M], dtype int32.
+
+    Returns:
+        Logits tensor of shape [M, N], dtype `torch.float32`.
+    """
+    k = kv.float()
+    q = q.float()
+    
+    seq_len_kv = kv.shape[0]
+    num_q, num_heads, head_dim = q.shape
+
+    # TODO: Make HEAD_CHUNK_SIZE as env variable if this non optimized vibe coded pytorch ops is still used in future build
+    # Because HEAD_CHUNK_SIZE is also used in vllm/model_executor/models/deepseek_v2.py - sparse_attn_indexer_fake for the profile run to get correct memory usage
+    # TUNE HEAD_CHUNK_SIZE according to AVAILABLE GPU VRAM 
+    # 1 heads * 2048 tokens * 2 (peak factor) * 32k context * 4 bytes ~= 0.5 GB memory peak / GPU.
+    HEAD_CHUNK_SIZE = 1 
+
+    # 1. Pre-allocate output
+    final_logits = torch.full(
+        (num_q, seq_len_kv), 
+        float("-inf"), 
+        device=q.device, 
+        dtype=torch.float32
+    )
+
+    # 2. Prepare Mask (Broadcasting later)
+    mask_lo = (
+        torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None]
+    )
+    mask_hi = (
+        torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None]
+    )
+    mask = mask_lo & mask_hi
+
+    # Accumulator
+    weighted_sum = torch.zeros((num_q, seq_len_kv), device=q.device, dtype=torch.float32)
+
+    # Permute for easier slicing: [H, M, D]
+    q_per_head = q.permute(1, 0, 2) 
+    weights_per_head = weights.t() # [H, M]
+    k_t = k.t() # [D, N]
+
+    # 3. Chunked Loop
+    for i in range(0, num_heads, HEAD_CHUNK_SIZE):
+        end = min(i + HEAD_CHUNK_SIZE, num_heads)
+        
+        # Slice the chunk: Shape [Chunk_Size, M, D]
+        q_chunk = q_per_head[i:end] 
+        w_chunk = weights_per_head[i:end].unsqueeze(-1) # [Chunk, M, 1]
+
+        # Matmul: [Chunk, M, D] @ [D, N] -> [Chunk, M, N]
+        # This is the heavy lifting.
+        score_chunk = torch.matmul(q_chunk, k_t)
+        
+        score_chunk = torch.relu(score_chunk)
+        
+        # Weighted sum: Sum over the chunk dimension (dim 0)
+        # [Chunk, M, N] * [Chunk, M, 1] -> [Chunk, M, N] -> Sum -> [M, N]
+        chunk_sum = (score_chunk * w_chunk).sum(dim=0)
+        
+        weighted_sum.add_(chunk_sum)
+        
+        # Explicit delete to encourage memory freeing before next chunk
+        del score_chunk
+        del chunk_sum
+
+    # 4. Final Masking
+    final_logits = torch.where(mask, weighted_sum, final_logits)
+
+    return final_logits
+
 
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
@@ -150,6 +238,50 @@ def fp8_paged_mqa_logits_torch(
                 i * next_n : (i + 1) * next_n,
                 block_rk * block_size : (block_rk + 1) * block_size,
             ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
+    return logits
+
+# Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
+def fp16_paged_mqa_logits_torch(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    max_model_len: int,
+):
+
+    batch_size, next_n, heads, dim = q.size()
+    num_block, block_size, _, dim = kv_cache.size()
+    logits = torch.full([batch_size * next_n, max_model_len], float('-inf'), device=q.device, dtype=torch.float32)
+    context_lens = context_lens.tolist()
+    
+    is_context_lens_2d = False # assumed to never be 2d
+   
+    for i in range(batch_size):
+        context_len = context_lens[i]
+        q_offsets = torch.full((next_n, ), context_len, device='cuda', dtype=torch.int32) if is_context_lens_2d \
+                    else torch.arange(context_len - next_n, context_len, device='cuda')
+        
+        weight_slice = (
+            weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+        )
+        
+        num_blocks = (context_len + block_size - 1) // block_size
+        block_idxs = block_tables[i][:num_blocks]
+        kv_slice = kv_cache[block_idxs]                 # [num_blocks, block_size, kv_heads, dim]
+        kx = kv_slice.permute(2, 3, 0, 1).reshape(kv_slice.size(2), dim, -1)    # [kv_heads, dim, total_tokens]
+        qx = q[i].transpose(0, 1)                       # q[i]: [next_n, heads, dim] -> [heads, next_n, dim]
+        s = torch.matmul(qx, kx).to(logits.dtype)       # [heads, next_n, dim] @ [1, dim, total_tokens] -> [heads, next_n, total_tokens] in fp32 here
+
+        total_len = num_blocks * block_size
+        k_offsets = torch.arange(0, total_len, device=q.device)
+        mask = (k_offsets[None, :] < context_len) & (k_offsets[None, :] <= q_offsets[:, None])
+        s = torch.where(mask[None, :, :], s, float('-inf'))     # mask shape: [1, next_n, total_tokens]
+        s = torch.relu(s) * weight_slice[..., None]             # weight_slice: [heads, next_n] -> [heads, next_n, 1]
+        s = s.sum(dim=0)                                        # [next_n, total_tokens]
+        logits[i * next_n:(i + 1) * next_n, :total_len] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float('-inf'))
+
     return logits
 
 
