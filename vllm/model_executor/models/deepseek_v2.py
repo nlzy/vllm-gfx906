@@ -601,45 +601,6 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         return DeepseekV32IndexerBackend
 
 
-def gather_k_from_cache(kv_cache, block_table, cu_seq_lens, head_dim):
-    """
-    Non Optimized vibe coded python gather (avoids torch.cat overhead by pre-allocating the result).
-    """
-    # 1. Pre-allocate the full output tensor at once
-    # We know the total size is the last cumulative sequence length
-    total_tokens = cu_seq_lens[-1].item()
-    k_out = torch.empty((total_tokens, head_dim), dtype=kv_cache.dtype, device=kv_cache.device)
-    
-    batch_size = block_table.shape[0]
-    block_size = kv_cache.shape[1]
-    
-    # 2. Iterate and fill (In-place copy)
-    for i in range(batch_size):
-        # Indices for the destination tensor
-        start_idx = cu_seq_lens[i].item()
-        end_idx = cu_seq_lens[i+1].item()
-        seq_len = end_idx - start_idx
-        
-        if seq_len == 0:
-            continue
-            
-        # Indices for the source cache
-        num_blocks = (seq_len + block_size - 1) // block_size
-        block_ids = block_table[i, :num_blocks].to(torch.long)
-        
-        # Gather blocks: [Num_Blocks, Block_Size, Head_Dim]
-        # Using advanced indexing here invokes a fast C++ kernel in PyTorch background
-        blocks = kv_cache[block_ids]
-        
-        # Reshape to linear and trim padding
-        # .view() is zero-copy, so this is fast
-        valid_k = blocks.view(-1, head_dim)[:seq_len]
-        
-        # Copy into the pre-allocated buffer
-        k_out[start_idx:end_idx].copy_(valid_k)
-        
-    return k_out
-
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -691,22 +652,11 @@ def sparse_attn_indexer(
             scale_fmt,
         )
     else:
-        # --------------------------------------------------------------------------
-        # STEP 1: Cache Population (Write)
-        # --------------------------------------------------------------------------
-        if slot_mapping is not None:
-            # kv_cache is already [Blocks, BlockSize, 128]
-            flat_cache = kv_cache.view(-1, head_dim)
-            
-            # --- FIX: Trust slot_mapping as the "Real" count ---
-            num_slots = slot_mapping.numel()
-            
-            # Slice k to remove the CUDA graph padding
-            k_valid = k[:num_slots]
-            
-            # Write valid data to valid slots
-            flat_cache.index_copy_(0, slot_mapping, k_valid)
-
+        ops.indexer_k_cache_fp16(
+            k,
+            kv_cache,
+            slot_mapping,
+        )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
@@ -731,26 +681,22 @@ def sparse_attn_indexer(
                     chunk.cu_seq_lens,
                 )
             else:
-                # ------------------------------------------------------------------
-                # STEP 2: Key Retrieval (Read GLOBAL History + Current)
-                # ------------------------------------------------------------------
-                # FIX: We cannot use k[chunk.start:chunk.end] because 'k' only contains
-                # the *new* tokens in this forward pass. We need the full history
-                # (including previous chunks) which now resides in kv_cache.
-                
-                # Using the helper function to gather K from the cache we just wrote to
-                k_fp = gather_k_from_cache(
-                    kv_cache=kv_cache,
-                    block_table=chunk.block_table,
-                    cu_seq_lens=chunk.cu_seq_lens,
-                    head_dim=head_dim
+                k_fp = torch.empty(
+                    [chunk.total_seq_lens, head_dim],
+                    device=k.device,
+                    dtype=torch.float16,
+                )
+                ops.cp_gather_indexer_k_cache_fp16(
+                    kv_cache,
+                    k_fp,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
                 )
             
             mqa_logits_func = fp8_mqa_logits
             if current_platform.is_rocm():
-                from vllm.attention.ops.rocm_aiter_mla_sparse import rocm_fp8_mqa_logits
-                from vllm.attention.ops.rocm_aiter_mla_sparse import fp16_mqa_logits_torch
-                mqa_logits_func = fp16_mqa_logits_torch if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16 else rocm_fp8_mqa_logits
+                from vllm.attention.ops.rocm_aiter_mla_sparse import rocm_mqa_logits
+                mqa_logits_func = rocm_mqa_logits
             
             logits = mqa_logits_func(
                 q[chunk.token_start : chunk.token_end], # q is valid to slice (current only), fp16 or fp8
@@ -802,12 +748,11 @@ def sparse_attn_indexer(
         paged_mqa_logits_func = fp8_paged_mqa_logits
         if current_platform.is_rocm():
             from vllm.attention.ops.rocm_aiter_mla_sparse import (
-                rocm_fp8_paged_mqa_logits,
+                rocm_paged_mqa_logits,
             )
-            from vllm.attention.ops.rocm_aiter_mla_sparse import fp16_paged_mqa_logits_torch
 
 
-            paged_mqa_logits_func = fp16_paged_mqa_logits_torch if envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16 else rocm_fp8_paged_mqa_logits
+            paged_mqa_logits_func = rocm_paged_mqa_logits
         logits = paged_mqa_logits_func(
             padded_q_decode_tokens, # fp16 or fp8
             kv_cache, # fp16 or fp8
@@ -877,25 +822,23 @@ def sparse_attn_indexer_fake(
         )
 
     if envs.VLLM_ATTENTION_BACKEND=="ROCM_AITER_MLA_SPARSE" and not envs.VLLM_ROCM_USE_AITER: 
-        # 1. Prefill Memory (Chunked)
-        # TODO: Make HEAD_CHUNK_SIZE as env variable if the non optimized vibe coded pytorch ops is still used in future build
-        # As HEAD_CHUNK_SIZE is also used in vllm/attention/ops/rocm_aiter_mla_sparse.py
-        HEAD_CHUNK_SIZE = 1
+        # In the profile run, q.shape[0] is typically max_num_batched_tokens (2048)
+        batch_size = q.shape[0]
         
-        # Calculate worst-case memory for one chunk
-        # TODO: To be fixed as that's not the real worst-case memory (tests with 16 MI50 shows +6% VRAM / GPU from gpu-memory-utilization value at peak)  
-        # Shape: [Chunk_Size, Q_Tokens, History_Len]
-        prefill_elements = HEAD_CHUNK_SIZE * q.shape[0] * total_seq_lens
-
-        # 2. Decode Memory
-        # Shape: [Batch_Size, Max_Model_Len]
-        # In decode, q.shape[0] is batch_size
-        decode_elements = q.shape[0] * max_model_len
-
-        # 3. Maximize
-        max_elements = max(prefill_elements, decode_elements)
-        _mimic_logits = torch.empty(
-            max_elements,
+        # We simulate the worst-case logits allocation.
+        # Even though Triton uses 1 tensor, we allocate 2x to create a safety buffer 
+        # against fragmentation and overhead from the Gather ops.
+        
+        # Buffer 1: The theoretical logits
+        _mimic_logits_1 = torch.empty(
+            (batch_size, max_model_len),
+            device=q.device, 
+            dtype=torch.float32 
+        )
+        
+        # Buffer 2: The safety padding (forces vLLM to reserve extra free VRAM)
+        _mimic_logits_2 = torch.empty(
+            (batch_size, max_model_len),
             device=q.device, 
             dtype=torch.float32 
         )

@@ -73,3 +73,16 @@ void cp_gather_indexer_k_quant_cache(
     torch::Tensor& dst_scale,  // [num_tokens, head_dim / quant_block_size * 4]
     const torch::Tensor& block_table,   // [batch_size, num_blocks]
     const torch::Tensor& cu_seq_lens);  // [batch_size + 1]
+
+// Indexer K FP16 cache function
+void indexer_k_cache_fp16(
+    torch::Tensor& k,               // [num_tokens, head_dim]
+    torch::Tensor& kv_cache,        // [num_blocks, block_size, cache_stride]
+    torch::Tensor& slot_mapping);    // [num_tokens]
+
+// Extract function to gather K FP16 cache
+void cp_gather_indexer_k_cache_fp16(
+    const torch::Tensor& kv_cache,       // [num_blocks, block_size, cache_stride]
+    torch::Tensor& dst_k,                // [num_tokens, head_dim]
+    const torch::Tensor& block_table,    // [batch_size, num_blocks]
+    const torch::Tensor& cu_seq_lens);     // [batch_size + 1]

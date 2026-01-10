@@ -728,6 +728,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "dst_scale, Tensor block_table, Tensor cu_seq_lens) -> ()");
   cache_ops.impl("cp_gather_indexer_k_quant_cache", torch::kCUDA,
                  &cp_gather_indexer_k_quant_cache);
+
+  cache_ops.def(
+      "indexer_k_cache_fp16(Tensor k, Tensor! kv_cache, Tensor "
+      "slot_mapping) -> ()");
+  cache_ops.impl("indexer_k_cache_fp16", torch::kCUDA,
+                 &indexer_k_cache_fp16);
+
+  cache_ops.def(
+      "cp_gather_indexer_k_cache_fp16(Tensor kv_cache, Tensor! dst_k, "
+      "Tensor block_table, Tensor cu_seq_lens) -> ()");
+  cache_ops.impl("cp_gather_indexer_k_cache_fp16", torch::kCUDA,
+                 &cp_gather_indexer_k_cache_fp16);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
