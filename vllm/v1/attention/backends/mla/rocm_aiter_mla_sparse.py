@@ -163,32 +163,44 @@ class ROCMAiterMLASparseMetadataBuilder(
 
 
 # Take from
-# https://github.com/deepseek-ai/FlashMLA/blob/main/tests/test_flash_mla_prefill.py#L72
+# https://github.com/deepseek-ai/FlashMLA/blob/082094b793fcc7452977d0a71a00e266a2e3061e/tests/ref.py
 def reference_mla_sparse_prefill(
-    q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, sm_scale: float, d_v: int
+    q: torch.Tensor, 
+    kv: torch.Tensor, 
+    indices: torch.Tensor, 
+    sm_scale: float, 
+    d_v: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    import math
-
-    def log2sumexp2(a: torch.Tensor, dim: int) -> torch.Tensor:
-        return torch.logsumexp(a * math.log(2), dim=dim) * math.log2(math.e)
-
-    skv = kv.shape[0]
-    sq = q.shape[0]
+    """
+    Returns:
+    - o: [s_q, h_q, dv]
+    - None (lse not returned as not used in the current implementation)
+    """
+    indices = indices.clone().squeeze(1)
     topk = indices.shape[-1]
-    dqk = q.shape[-1]
-    indices = indices[:, 0, :]  # [s_q, topk]
-    invalid_indices_mask = (indices < 0) | (indices >= skv)
-    indices[invalid_indices_mask] = 0
-    qs = q  # [s_q, h_q, d_qk]
-    kvs = kv[:, 0, :][indices].view(sq, topk, dqk)  # [s_q, topk, d_qk]
+    s_kv = kv.shape[0]
+    s_q, h_q, d_qk = q.shape  # [s_q, h_q, d_qk]
+    invalid_mask = (indices < 0) | (indices >= s_kv)    # [s_q, topk]
+    indices[invalid_mask] = 0
 
-    attn_score = (qs @ kvs.transpose(1, 2)).float()  # [s_q, h_q, topk]
-    attn_score.masked_fill_(invalid_indices_mask.unsqueeze(1), float("-inf"))
-    attn_score *= sm_scale * math.log2(math.e)
-    lse = log2sumexp2(attn_score, dim=-1)  # [s_q, h_q]
-    attn_score = torch.exp2(attn_score - lse.unsqueeze(-1))  # [s_q, h_q, topk]
-    result = attn_score.to(q.dtype) @ kvs[:, :, :d_v]
-    return (result, lse)
+    q = q.float()
+    gathered_kv = kv.index_select(dim=0, index=indices.flatten()).reshape(s_q, topk, d_qk).float()   # [s_q, topk, d_qk]
+    P = (q @ gathered_kv.transpose(1, 2))   # [s_q, h_q, topk]
+    P *= sm_scale
+    P[invalid_mask.unsqueeze(1).broadcast_to(P.shape)] = float("-inf")
+
+    orig_lse = torch.logsumexp(P, dim=-1)   # [s_q, h_q]
+    #max_logits = P.max(dim=-1).values   # [s_q, h_q]
+
+    if not torch.is_inference_mode_enabled():
+        orig_lse = orig_lse.clone()
+    orig_lse[orig_lse == float("-inf")] = float("+inf")   # So that corresponding O will be 0
+    s_for_o = torch.exp(P - orig_lse.unsqueeze(-1))
+    out = s_for_o @ gathered_kv[..., :d_v]   # [s_q, h_q, dv]
+
+    #lonely_q_mask = orig_lse == float("-inf")   # [s_q, h_q]
+    #orig_lse[lonely_q_mask] = float("+inf")
+    return (out.to(kv.dtype), None)
 
 
 class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):

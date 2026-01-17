@@ -5,7 +5,6 @@ from functools import lru_cache
 
 import torch
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -94,7 +93,7 @@ def _fp16_mqa_logits_kernel(
             w_tile = tl.load(w_ptrs, mask=mask_q, other=0.0)
 
             # Compute Dot: [BLOCK_Q, D] @ [D, BLOCK_KV] -> [BLOCK_Q, BLOCK_KV]
-            score = tl.dot(q_tile, kv_block)
+            score = tl.dot(q_tile.to(tl.float32), kv_block.to(tl.float32))
             
             # Apply ReLU and Weight
             score = tl.maximum(score, 0.0)
@@ -121,6 +120,7 @@ def _fp16_mqa_logits_kernel(
         final_mask = mask_q[:, None] & mask_kv & in_window
         tl.store(logits_ptrs, acc, mask=final_mask)
 
+# First implementation attempt, not optimized, currently slower than torch reference
 def fp16_mqa_logits(
     Q,
     KV,
@@ -265,13 +265,13 @@ def fp16_mqa_logits_torch(
     q = q.float()
     
     seq_len_kv = kv.shape[0]
-    num_q, num_heads, head_dim = q.shape
+    num_q, num_heads, _ = q.shape
 
     # TODO: Make HEAD_CHUNK_SIZE as env variable if this non optimized vibe coded pytorch ops is still used in future build
     # Because HEAD_CHUNK_SIZE is also used in vllm/model_executor/models/deepseek_v2.py - sparse_attn_indexer_fake for the profile run to get correct memory usage
     # TUNE HEAD_CHUNK_SIZE according to AVAILABLE GPU VRAM 
-    # 1 heads * 2048 tokens * 2 (peak factor) * 32k context * 4 bytes ~= 0.5 GB memory peak / GPU.
-    HEAD_CHUNK_SIZE = 1 
+    # 4 heads * 512 tokens * 2 (peak factor) * 32k context * 4 bytes ~= 0.5 GB memory peak / GPU.
+    HEAD_CHUNK_SIZE = 4 
 
     # 1. Pre-allocate output
     final_logits = torch.full(
@@ -456,7 +456,7 @@ def fp16_paged_mqa_logits_torch(
         kv_slice = kv_cache[block_idxs]                 # [num_blocks, block_size, kv_heads, dim]
         kx = kv_slice.permute(2, 3, 0, 1).reshape(kv_slice.size(2), dim, -1)    # [kv_heads, dim, total_tokens]
         qx = q[i].transpose(0, 1)                       # q[i]: [next_n, heads, dim] -> [heads, next_n, dim]
-        s = torch.matmul(qx, kx).to(logits.dtype)       # [heads, next_n, dim] @ [1, dim, total_tokens] -> [heads, next_n, total_tokens] in fp32 here
+        s = torch.matmul(qx.float(), kx.float())       # [heads, next_n, dim] @ [1, dim, total_tokens] -> [heads, next_n, total_tokens] in fp32 here
 
         total_len = num_blocks * block_size
         k_offsets = torch.arange(0, total_len, device=q.device)
@@ -637,7 +637,7 @@ def _deepgemm_fp16_paged_mqa_logits_stage1(
         )
 
         # 5. Dot Product (FORCE FP32 ACCUMULATION)
-        o = tl.dot(q, k.T, out_dtype=tl.float32)
+        o = tl.dot(q.to(tl.float32), k.T.to(tl.float32), out_dtype=tl.float32)
         
         # 6. Activation (ReLU)
         # Matches reference: s = torch.relu(s)
@@ -666,6 +666,7 @@ def _deepgemm_fp16_paged_mqa_logits_stage1(
         )
         
 
+# First implementation attempt, not optimized, currently less stable (at 18k+ tokens context) but faster than torch reference
 def deepgemm_fp16_paged_mqa_logits_stage1(
     q: torch.Tensor,           # [Batch, NextN, Heads, Dim] (FP16)
     kv_cache: torch.Tensor,    # [NumBlocks, BlockSize, 1, Dim] (FP16)
