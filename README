@@ -1,6 +1,19 @@
 vLLM for gfx906
 ===================
 
+
+ARICHIVED
+-------------------
+
+Over the past year, almost all open-weight models have grown increasingly large,
+far exceeding my capacity for development and testing. Coupled with the rising
+price of MI50 GPUs, I am reluctant to keep adding more cards. I have now
+archived this repository; everyone is welcome to fork it.
+
+
+ORIGINAL README
+-------------------
+
 This is a modified version of vLLM, works with (and only works with) AMD gfx906
 GPUs such as Radeon VII / Radeon Pro VII / Instinct MI50 / Instinct MI60.
 
@@ -35,134 +48,6 @@ in llm-compressor are not support.
 
 All MoE quantization models are significantly slow, and all unquantized models
 are slightly slow. Not recommended to use.
-
-
-NEWS
--------------------
-
-2025-12-08:
-
-Update vLLM v0.11.2 / torch 2.9.0 / triton 3.5.0
-
-
-2025-09-12:
-
-Minor optimize in triton_unified_attention, reduce VRAM usage of AWQ
-
-
-2025-09-10:
-
-Update vLLM to v0.10.1
-
-Re-enable V1 and Automatic Prefix Caching by default. Adjusted some default
-parameters of V1 engine to better suit gfx906.
-
-Optimized unquantized FP16 GEMM / GEMV, by enable skinny unquantized GEMV
-kernel, a triton unquantized GEMM implementation is also added. TG speed is
-~90% faster on unquantized models and ~10% faster on GPTQ / AWQ models at low
-batch sizes.
-
-
-2025-08-24:
-
-Backported support for GLM 4.5 (thanks to @anikifoss).
-
-Added support for quantized MoE models packed in AWQ / GPTQ formats. Add
-support for asymmetric quantization in ExllamaLinearKernel.
-
-Optimized the exllama 8-bit dequant kernel, making 8-bit GPTQ dense models 10%
-faster at low batch sizes. Disable bf16, explicitly adding --dtype float16 is
-no longer necessary.
-
-
-2025-08-16:
-
-Add support for quantized MoE models. Fix support for vLLM's llm-compressor.
-
-Switch back to V0 engine by default. Many users have reported a significant
-performance drop after upgrading to V1.
-
-
-2025-07-08:
-
-Update vLLM to 0.9.2
-
-From this version, V1 engine is default. Startup takes longer time than V0.
-Automatic Prefix Caching is off by default due to performance issues. Needs
-investigating.
-
-
-2025-06-10:
-
-I made some optimization on GPTQ and AWQ kernel. Now, single batch got about 5%
-faster, and batch sizes between 8-32 got about 30%-50% faster.
-
-Update vLLM to 0.9.1
-
-
-2025-05-27:
-
-Add support for AWQ quantization on gfx906 without triton, use the same kernel
-with GPTQ, so the performance of AWQ should be on par with GPTQ.
-
-Update vLLM to 0.9.0
-
-
-2025-05-02:
-
-Update vLLM to 0.8.5
-
-Upstream vLLM 0.8.5 has lots of issues with ROCm platform, which have already
-been fixed in the main branch. I cherry-picked those fixes.
-
-I also fixed the issue of garbled output for GPTQ desc_act=True models.
-
-
-2025-04-29:
-
-I have fixed GGUF batched request performance issue. Now it's usable, but still
-not as fast as GPTQ.
-
-I also added some autotune configs to `triton_flash_attention.py` by increasing
-`num_stages`.
-
-
-2025-04-28:
-
-Update rocm to 6.3
-Update torch to 2.7.0
-Update triton to 3.3.0
-
-
-2025-04-22:
-
-I have fixed GPTQ Int4/Int8 GEMV kernel, by changing dot product accumulator
-type from FP16 to FP32 to avoid calculation overflow. Thanks to the fdot2
-intrinsic introduced in Vega 12/20, using FP32 accumulators remains fast and
-guarantees no overflow.
-
-
-2025-04-21:
-
-Update vLLM to v0.8.4
-
-
-2025-04-20:
-
-I changed the reconstruct threshold in GPTQ GEMM kernel. This is a temporary
-fix for Qwen2 GPTQ models outputting infinite "!!!!!!!!!!!!!!!!!!!"
-
-
-2025-04-19:
-
-I attempted to optimize AWQ, by adding '@triton.autotune' to triton_awq.py.
-This improved performance by about 50%, but it's still very slow on gfx906 GPUs.
-
-
-2025-04-01:
-
-Optimized the GEMV kernel for GGUF q4_1 and q8_0 quantization, achieving
-10%~20% performance improve.
 
 
 BUILD
